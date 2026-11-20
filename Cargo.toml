@@ -10,16 +10,9 @@ description = "10x lower latency for cloud-native DataFusion"
 
 [workspace]
 members = [
-	"benchmark",
-	"src/datafusion-server",
-	"src/datafusion-client",
-	"src/datafusion",
 	"src/common",
 	"src/core",
-	"src/datafusion-local",
-	"examples",
-	"fuzz",
-	"dev/dev-tools",
+	"src/datafusion",
 ]
 resolver = "3"
 
@@ -30,24 +23,24 @@ liquid-cache-datafusion = { path = "src/datafusion", version = "0.1.13" }
 liquid-cache-common = { path = "src/common", version = "0.1.13" }
 liquid-cache = { path = "src/core", version = "0.1.13" }
 liquid-cache-datafusion-local = { path = "src/datafusion-local", version = "0.1.13" }
-arrow = { version = "59.2.0", default-features = false, features = [
+arrow = { version = "60.1.0", default-features = false, features = [
 	"prettyprint",
 	"ipc",
 ] }
-arrow-flight = { version = "59.2.0", features = ["flight-sql-experimental"] }
-arrow-schema = { version = "59.2.0", features = ["serde"] }
-parquet = { version = "59.2.0", features = [
+arrow-flight = { version = "60.1.0", features = ["flight-sql"] }
+arrow-schema = { version = "60.1.0", features = ["serde"] }
+parquet = { version = "60.1.0", features = [
 	"async",
 	"experimental",
 	"variant_experimental",
 ] }
-parquet-variant-json = { version = "59.2.0" }
-datafusion = { version = "55.0.0" }
-datafusion-datasource = { version = "55.0.0" }
-datafusion-common = { version = "55.0.0" }
-datafusion-expr-common = { version = "55.0.0" }
-datafusion-physical-expr = { version = "55.0.0" }
-datafusion-proto = { version = "55.0.0" }
+parquet-variant-json = { version = "60.1.0" }
+datafusion = { git = "https://github.com/bonchief/datafusion.git", rev = "a34af9e14b6db55ff1e453b6a1432679785c9dc4" }
+datafusion-datasource = { git = "https://github.com/bonchief/datafusion.git", rev = "a34af9e14b6db55ff1e453b6a1432679785c9dc4" }
+datafusion-common = { git = "https://github.com/bonchief/datafusion.git", rev = "a34af9e14b6db55ff1e453b6a1432679785c9dc4" }
+datafusion-expr-common = { git = "https://github.com/bonchief/datafusion.git", rev = "a34af9e14b6db55ff1e453b6a1432679785c9dc4" }
+datafusion-physical-expr = { git = "https://github.com/bonchief/datafusion.git", rev = "a34af9e14b6db55ff1e453b6a1432679785c9dc4" }
+datafusion-proto = { git = "https://github.com/bonchief/datafusion.git", rev = "a34af9e14b6db55ff1e453b6a1432679785c9dc4" }
 async-trait = "0.1.89"
 futures = { version = "0.3.32", default-features = false, features = ["std"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
@@ -57,7 +50,7 @@ url = "2.5.8"
 bytes = { version = "1.11.1", default-features = false }
 ahash = "0.8.12"
 prost = "0.14.4"
-object_store = { version = "0.13.2", default-features = false }
+object_store = { version = "0.14.2", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 tempfile = "3.27.0"
@@ -66,25 +59,25 @@ fastrace = "0.7"
 fastrace-tonic = "0.2"
 congee = "0.4.1"
 insta = { version = "1.47.2", features = ["filters"] }
-t4 = "0.1.9"
-vortex-array = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-arrow = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-btrblocks = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-ipc = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-buffer = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-mask = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-session = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-error = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-fastlanes = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-fsst = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-alp = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-runend = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-sparse = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-zigzag = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-datetime-parts = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-decimal-byte-parts = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-bytebool = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
-vortex-sequence = { git = "https://github.com/vortex-data/vortex", rev = "265b7053ac80c3ee9ddccf1fb66f85effa902c62", default-features = false }
+t4 = { version = "0.1.9", default-features = false }
+vortex-array = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-arrow = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-btrblocks = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-ipc = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-buffer = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-mask = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-session = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-error = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-fastlanes = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-fsst = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-alp = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-runend = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-sparse = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-zigzag = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-datetime-parts = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-decimal-byte-parts = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-bytebool = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
+vortex-sequence = { git = "file:///tmp/reference-repos/vortex-bonchief", rev = "a36060752c9b641b29213e65dbd76e7ec1686935", default-features = false }
 
 [profile.dev.package]
 insta.opt-level = 3

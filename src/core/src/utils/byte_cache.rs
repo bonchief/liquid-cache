@@ -258,6 +258,7 @@ impl ObjectStore for ByteCache {
 
         // Return a GetResult with the stream of bytes from cache
         Ok(GetResult {
+            extensions: Default::default(),
             payload: GetResultPayload::Stream(Box::pin(
                 self.get_range_from_cache_stream(location, &range),
             )),

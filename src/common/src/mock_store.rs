@@ -267,6 +267,7 @@ impl ObjectStore for MockStore {
         storage.next_etag += 1;
 
         Ok(PutResult {
+            extensions: Default::default(),
             e_tag: Some(etag.to_string()),
             version: None,
         })
@@ -289,6 +290,7 @@ impl ObjectStore for MockStore {
         if options.head {
             let stream = futures::stream::empty().boxed();
             return Ok(GetResult {
+                extensions: Default::default(),
                 payload: GetResultPayload::Stream(stream),
                 attributes: entry.attributes,
                 meta,
@@ -318,6 +320,7 @@ impl ObjectStore for MockStore {
         let stream = futures::stream::once(futures::future::ready(Ok(data)));
 
         Ok(GetResult {
+            extensions: Default::default(),
             payload: GetResultPayload::Stream(stream.boxed()),
             attributes: entry.attributes,
             meta,
@@ -395,6 +398,7 @@ impl ObjectStore for MockStore {
         }
 
         Ok(ListResult {
+            extensions: Default::default(),
             objects,
             common_prefixes: common_prefixes.into_iter().collect(),
         })

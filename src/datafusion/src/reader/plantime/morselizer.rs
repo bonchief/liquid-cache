@@ -443,7 +443,11 @@ fn prepare_and_prune_by_stats(mut loaded: MetadataLoadedLiquidOpen) -> Result<Li
     )?;
     let mut row_groups = RowGroupAccessPlanFilter::new(access_plan);
     if let Some(range) = &loaded.prepared.file_range {
-        row_groups.prune_by_range(row_group_metadata, range);
+        row_groups.prune_by_range(
+            row_group_metadata,
+            range,
+            datafusion::common::parquet_config::RowGroupRangeAssignment::StartOffset,
+        );
     }
     if let Some(predicate) = pruning_predicate.as_deref() {
         row_groups.prune_by_statistics(
