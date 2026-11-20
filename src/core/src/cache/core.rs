@@ -68,6 +68,9 @@ pub struct LiquidCache {
     disk_key_locks: DiskKeyLocks,
     stray_objects: StrayObjects,
     evict_victims_concurrently: bool,
+    /// Whether an inserted byte array is transcoded to Liquid on a background
+    /// task ([`Self::transcode_text_in_background`]).
+    background_text: std::sync::atomic::AtomicBool,
 }
 
 /// Orders the store operations on one key.
@@ -329,6 +332,41 @@ impl LiquidCache {
         batch_to_cache: ArrayRef,
     ) -> Insert<'a> {
         Insert::new(self, entry_id, identity, batch_to_cache)
+    }
+
+    /// Insert byte arrays (text and binary) as Arrow, then transcode each to
+    /// Liquid on a background task and swap it in if the slot still holds
+    /// that array. The insert, and so the query that read the array, never
+    /// pays for the transcode. Off by default.
+    pub fn transcode_text_in_background(&self, on: bool) {
+        self.background_text
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn background_text(&self) -> bool {
+        self.background_text
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Replace `entry_id`'s Arrow `array` by `liquid`, if its slot still holds
+    /// that very array for `identity`; otherwise the transcode is dropped.
+    pub(crate) async fn swap_in_liquid(
+        &self,
+        entry_id: EntryID,
+        identity: u64,
+        array: &ArrayRef,
+        liquid: crate::liquid_array::LiquidArrayRef,
+    ) {
+        let current = self.index.get(&entry_id).is_some_and(|slot| {
+            slot.belongs_to(identity)
+                && matches!(&slot.entry, CacheEntry::MemoryArrow(held) if Arc::ptr_eq(held, array))
+        });
+        if current {
+            // A full cache refuses the swap; the Arrow entry stays.
+            let _ = self
+                .insert_inner(entry_id, identity, CacheEntry::memory_liquid(liquid))
+                .await;
+        }
     }
 
     /// Create a [`Get`] builder for the provided entry, as cached for `identity`.
@@ -754,6 +792,7 @@ impl LiquidCache {
             disk_key_locks: DiskKeyLocks::new(),
             stray_objects: StrayObjects::default(),
             evict_victims_concurrently,
+            background_text: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

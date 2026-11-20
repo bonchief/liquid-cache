@@ -170,6 +170,22 @@ pub fn default_max_memory_bytes() -> usize {
     usize::try_from(half).unwrap_or(usize::MAX)
 }
 
+/// Whether `kind` is a byte array, which a background transcode turns into
+/// Liquid ([`LiquidCache::transcode_text_in_background`]).
+fn is_bytes(kind: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+    match kind {
+        DataType::Utf8
+        | DataType::Utf8View
+        | DataType::LargeUtf8
+        | DataType::Binary
+        | DataType::BinaryView
+        | DataType::LargeBinary => true,
+        DataType::Dictionary(_, value) => is_bytes(value),
+        _ => false,
+    }
+}
+
 /// Builder returned by [`LiquidCache::insert`] for configuring cache writes.
 #[derive(Debug)]
 pub struct Insert<'a> {
@@ -219,10 +235,31 @@ impl<'a> Insert<'a> {
         if let Some(lineage) = self.lineage {
             self.storage.add_lineage(&self.entry_id, lineage);
         }
-        let batch = CacheEntry::memory_arrow(batch);
+        let text = self.storage.background_text() && is_bytes(batch.data_type());
         self.storage
-            .insert_inner(self.entry_id, self.identity, batch)
-            .await
+            .insert_inner(
+                self.entry_id,
+                self.identity,
+                CacheEntry::memory_arrow(Arc::clone(&batch)),
+            )
+            .await?;
+        if text && let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let storage = Arc::clone(self.storage);
+            let (entry_id, identity) = (self.entry_id, self.identity);
+            runtime.spawn(async move {
+                let arrow = Arc::clone(&batch);
+                let liquid = tokio::task::spawn_blocking(move || {
+                    crate::liquid_array::LiquidArray::from_arrow_array(&arrow).ok()
+                })
+                .await;
+                if let Ok(Some(liquid)) = liquid {
+                    storage
+                        .swap_in_liquid(entry_id, identity, &batch, Arc::new(liquid))
+                        .await;
+                }
+            });
+        }
+        Ok(())
     }
 }
 
