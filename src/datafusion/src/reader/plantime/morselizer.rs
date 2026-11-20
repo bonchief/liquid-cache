@@ -117,9 +117,9 @@ impl Morselizer for LiquidMorselizer {
         let file_name = partitioned_file.object_meta.location.to_string();
         let metrics = LiquidFileMetrics::new(self.partition_index, &file_name, &self.metrics);
         let metadata_size_hint = partitioned_file.metadata_size_hint;
-        let file_identity = ParquetFileIdentity::new(
+        let file_identity = ParquetFileIdentity::of(
             self.object_store_url.clone(),
-            partitioned_file.object_meta.location.to_string(),
+            &partitioned_file.object_meta,
         );
         let reader_factory = Arc::new(LiquidFileReaderFactory {
             factory: Arc::clone(&self.parquet_file_reader_factory),

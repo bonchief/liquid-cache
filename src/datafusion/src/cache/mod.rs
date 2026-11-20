@@ -44,11 +44,17 @@ pub type ColumnLineages = HashMap<String, Arc<CacheExpression>>;
 /// The identity of a Parquet object within an object store.
 ///
 /// Object paths are only unique within their object store, so both components
-/// are required to keep cached data from different stores isolated.
+/// are required to keep cached data from different stores isolated. A path
+/// can also be rewritten in place, so the object's size and version tag (its
+/// ETag, or whatever content digest the caller puts there) are part of it too:
+/// another object at the same path is another file, never served this one's
+/// entries.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ParquetFileIdentity {
     object_store_url: ObjectStoreUrl,
     path: String,
+    size: u64,
+    version: Option<String>,
 }
 
 impl ParquetFileIdentity {
@@ -57,6 +63,18 @@ impl ParquetFileIdentity {
         Self {
             object_store_url,
             path,
+            size: 0,
+            version: None,
+        }
+    }
+
+    /// Create the identity of the object `meta` names in `object_store_url`.
+    pub fn of(object_store_url: ObjectStoreUrl, meta: &object_store::ObjectMeta) -> Self {
+        Self {
+            object_store_url,
+            path: meta.location.to_string(),
+            size: meta.size,
+            version: meta.e_tag.clone(),
         }
     }
 }
