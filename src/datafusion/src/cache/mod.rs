@@ -613,6 +613,26 @@ impl LiquidCacheParquet {
         file
     }
 
+    /// Whether the cache holds every batch of `rows` rows of column `column`
+    /// (its index in the file schema) in row group `row_group` of `file`.
+    /// Registers nothing: a file the cache does not know holds nothing.
+    pub fn holds(
+        &self,
+        file: &ParquetFileIdentity,
+        row_group: u64,
+        column: u64,
+        rows: usize,
+    ) -> bool {
+        let Some(key) = self.files.lock().unwrap().key(file) else {
+            return false;
+        };
+        let path = ColumnAccessPath::new(key.slot as u64, row_group, column);
+        (0..rows.div_ceil(self.batch_size())).all(|batch| {
+            let id = path.entry_id(BatchID::from_raw(batch as u16));
+            self.cache_store.contains(&id.into(), key.identity)
+        })
+    }
+
     /// Forget every registered file that no handle refers to and that has
     /// nothing cached, with the lineage hints kept for it. Returns how many
     /// were forgotten.

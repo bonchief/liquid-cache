@@ -124,6 +124,11 @@ impl FileRegistry {
         (key, lease, true)
     }
 
+    /// Where `identity`'s entries live, if it is registered.
+    pub(crate) fn key(&self, identity: &ParquetFileIdentity) -> Option<FileKey> {
+        self.files.get(identity).map(|file| file.key)
+    }
+
     /// How many files are registered.
     pub(crate) fn len(&self) -> usize {
         self.files.len()
