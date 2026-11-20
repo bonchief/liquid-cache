@@ -235,13 +235,31 @@ impl<'a> Insert<'a> {
         if let Some(lineage) = self.lineage {
             self.storage.add_lineage(&self.entry_id, lineage);
         }
-        // A slot to transcode in the background, taken now: without one the
-        // array stays Arrow and nothing waits on it.
-        let slot = self
+        let text = self
             .storage
             .background_text()
-            .filter(|_| is_bytes(batch.data_type()))
-            .and_then(|transcodes| {
+            .filter(|_| is_bytes(batch.data_type()));
+        // Above half the memory budget, a text array goes in as Liquid at
+        // once, transcoded on the inserting thread: its Arrow form, several
+        // times larger, would otherwise crowd out held entries until the
+        // background got to it.
+        if text.is_some()
+            && self.storage.budget().memory_usage_bytes() * 2
+                >= self.storage.config().max_memory_bytes()
+            && let Ok(liquid) = crate::liquid_array::LiquidArray::from_arrow_array(&batch)
+        {
+            return self
+                .storage
+                .insert_inner(
+                    self.entry_id,
+                    self.identity,
+                    CacheEntry::memory_liquid(Arc::new(liquid)),
+                )
+                .await;
+        }
+        // A slot to transcode in the background, taken now: without one the
+        // array stays Arrow and nothing waits on it.
+        let slot = text.and_then(|transcodes| {
                 let taken = Arc::clone(&transcodes.taken).try_acquire_owned().ok()?;
                 Some((taken, Arc::clone(&transcodes.running)))
             });

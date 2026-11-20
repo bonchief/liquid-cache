@@ -350,7 +350,9 @@ impl LiquidCache {
     /// that array. The insert, and so the query that read the array, never
     /// pays for the transcode. At most `workers` transcode at once and
     /// `queued` more wait; an array inserted while that many are taken stays
-    /// Arrow. Off by default; the first call sets the bounds.
+    /// Arrow. Above half the memory budget an array is transcoded on the
+    /// inserting thread instead and goes in as Liquid. Off by default; the
+    /// first call sets the bounds.
     pub fn transcode_text_in_background(&self, workers: usize, queued: usize) {
         let _ = self.background_text.set(Transcodes {
             running: Arc::new(tokio::sync::Semaphore::new(workers)),
