@@ -4453,7 +4453,7 @@ dependencies = [
 [[package]]
 name = "vortex-alp"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "alp",
  "itertools 0.14.0",
@@ -4470,7 +4470,7 @@ dependencies = [
 [[package]]
 name = "vortex-array"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "arc-swap",
  "arcref",
@@ -4516,7 +4516,7 @@ dependencies = [
 [[package]]
 name = "vortex-array-macros"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4526,7 +4526,7 @@ dependencies = [
 [[package]]
 name = "vortex-arrow"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4549,7 +4549,7 @@ dependencies = [
 [[package]]
 name = "vortex-btrblocks"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "itertools 0.14.0",
  "rand 0.10.2",
@@ -4572,7 +4572,7 @@ dependencies = [
 [[package]]
 name = "vortex-buffer"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "allocator-api2",
  "arrow-buffer",
@@ -4586,7 +4586,7 @@ dependencies = [
 [[package]]
 name = "vortex-bytebool"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "num-traits",
  "vortex-array",
@@ -4598,7 +4598,7 @@ dependencies = [
 [[package]]
 name = "vortex-compressor"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -4616,7 +4616,7 @@ dependencies = [
 [[package]]
 name = "vortex-compute"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "vortex-buffer",
 ]
@@ -4624,7 +4624,7 @@ dependencies = [
 [[package]]
 name = "vortex-datetime-parts"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "num-traits",
  "prost",
@@ -4638,7 +4638,7 @@ dependencies = [
 [[package]]
 name = "vortex-decimal-byte-parts"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "num-traits",
  "prost",
@@ -4652,7 +4652,7 @@ dependencies = [
 [[package]]
 name = "vortex-error"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "arrow-schema",
  "flatbuffers",
@@ -4663,7 +4663,7 @@ dependencies = [
 [[package]]
 name = "vortex-fastlanes"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "fastlanes 0.7.0",
  "itertools 0.14.0",
@@ -4680,7 +4680,7 @@ dependencies = [
 [[package]]
 name = "vortex-flatbuffers"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "flatbuffers",
  "vortex-buffer",
@@ -4690,7 +4690,7 @@ dependencies = [
 [[package]]
 name = "vortex-fsst"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "fsst-rs",
  "num-traits",
@@ -4705,7 +4705,7 @@ dependencies = [
 [[package]]
 name = "vortex-ipc"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "bytes",
  "flatbuffers",
@@ -4722,7 +4722,7 @@ dependencies = [
 [[package]]
 name = "vortex-mask"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "itertools 0.14.0",
  "vortex-buffer",
@@ -4732,7 +4732,7 @@ dependencies = [
 [[package]]
 name = "vortex-proto"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "prost",
  "prost-types",
@@ -4741,7 +4741,7 @@ dependencies = [
 [[package]]
 name = "vortex-runend"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -4756,7 +4756,7 @@ dependencies = [
 [[package]]
 name = "vortex-sequence"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "num-traits",
  "prost",
@@ -4772,7 +4772,7 @@ dependencies = [
 [[package]]
 name = "vortex-session"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "arc-swap",
  "lasso",
@@ -4784,7 +4784,7 @@ dependencies = [
 [[package]]
 name = "vortex-sparse"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
@@ -4799,7 +4799,7 @@ dependencies = [
 [[package]]
 name = "vortex-utils"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "hashbrown 0.17.1",
 ]
@@ -4807,7 +4807,7 @@ dependencies = [
 [[package]]
 name = "vortex-zigzag"
 version = "0.1.0"
-source = "git+file:///tmp/reference-repos/vortex-bonchief?rev=a36060752c9b641b29213e65dbd76e7ec1686935#a36060752c9b641b29213e65dbd76e7ec1686935"
+source = "git+https://github.com/bonchief/vortex?rev=7f682fe77e7f541352e0f03014401e0c5c9e87b9#7f682fe77e7f541352e0f03014401e0c5c9e87b9"
 dependencies = [
  "vortex-array",
  "vortex-buffer",
