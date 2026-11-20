@@ -262,6 +262,11 @@ impl<'a> Insert<'a> {
                 let Ok(_running) = running.acquire_owned().await else {
                     return;
                 };
+                // The array as the slot holds it now: gone or replaced, there
+                // is nothing to transcode.
+                let Some(batch) = storage.held_arrow(&entry_id, identity) else {
+                    return;
+                };
                 let arrow = Arc::clone(&batch);
                 let liquid = tokio::task::spawn_blocking(move || {
                     crate::liquid_array::LiquidArray::from_arrow_array(&arrow).ok()

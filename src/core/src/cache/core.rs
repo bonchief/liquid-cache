@@ -78,7 +78,9 @@ pub struct LiquidCache {
 pub(crate) struct Transcodes {
     /// Permits to run: at most this many blocking threads transcode at once.
     pub(crate) running: Arc<tokio::sync::Semaphore>,
-    /// Permits to be queued or running. An array that finds none stays Arrow.
+    /// Permits to be queued or running. A queued transcode holds only its
+    /// entry's id and reads the array when it runs, so a long queue pins no
+    /// array the cache dropped. An array that finds no permit stays Arrow.
     pub(crate) taken: Arc<tokio::sync::Semaphore>,
 }
 
@@ -362,6 +364,15 @@ impl LiquidCache {
 
     /// Replace `entry_id`'s Arrow `array` by `liquid`, if its slot still holds
     /// that very array for `identity`; otherwise the transcode is dropped.
+    /// The Arrow array `entry_id` holds for `identity`, if it holds one.
+    pub(crate) fn held_arrow(&self, entry_id: &EntryID, identity: u64) -> Option<ArrayRef> {
+        let slot = self.index.get(entry_id)?;
+        match &slot.entry {
+            CacheEntry::MemoryArrow(held) if slot.belongs_to(identity) => Some(Arc::clone(held)),
+            _ => None,
+        }
+    }
+
     pub(crate) async fn swap_in_liquid(
         &self,
         entry_id: EntryID,
