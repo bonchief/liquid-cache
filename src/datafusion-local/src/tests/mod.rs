@@ -24,6 +24,7 @@ mod constant_conjunct;
 mod date_optimizer;
 mod filter_limit;
 mod nested_filter;
+mod unevaluable_conjunct;
 mod variants;
 mod virtual_column;
 

@@ -242,6 +242,16 @@ impl LiquidCache {
         self.index.contains(entry_id, identity)
     }
 
+    /// How many lookups found their key held by a different identity, and
+    /// missed rather than serve it.
+    ///
+    /// Zero unless two sources compute the same [`EntryID`]. Each such lookup
+    /// was served correctly; a rising count means those sources cannot share
+    /// the cache.
+    pub fn identity_mismatches(&self) -> u64 {
+        self.index.identity_mismatches()
+    }
+
     /// Get the config of the cache.
     pub fn config(&self) -> &CacheConfig {
         &self.config

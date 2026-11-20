@@ -461,6 +461,29 @@ impl LiquidCacheParquet {
         ))
     }
 
+    /// How many distinct files have been registered with this cache.
+    ///
+    /// File ids are never reused, so this counts every file ever registered,
+    /// not only those being read now.
+    pub fn leased_file_ids(&self) -> usize {
+        self.files.lock().unwrap().len()
+    }
+
+    /// How many file ids have been handed out that do not fit the cache key's
+    /// 16-bit file field. Above zero, distinct files compute the same keys:
+    /// each is served correctly, but they cannot share the cache.
+    pub fn file_ids_over_key_width(&self) -> u64 {
+        self.current_file_id
+            .load(Ordering::Relaxed)
+            .saturating_sub(1 << 16)
+    }
+
+    /// How many cache lookups found a key held by another file, and missed
+    /// rather than serve it.
+    pub fn identity_mismatches(&self) -> u64 {
+        self.cache_store.identity_mismatches()
+    }
+
     /// Get the batch size of the cache.
     pub fn batch_size(&self) -> usize {
         self.cache_store.config().batch_size()

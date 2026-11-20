@@ -3,11 +3,12 @@ use std::{
     fmt::{Debug, Formatter},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
 };
 
 use crate::cache::{cached_batch::CacheEntry, utils::EntryID};
+use crate::sync::RwLock;
 
 /// What the index holds for a key: the entry, and the identity of the source
 /// it was cached for.
@@ -28,9 +29,44 @@ impl Slot {
     }
 }
 
+/// The value stored in the tree: a [`Slot`] behind a cell the index empties
+/// the moment it gives the slot up.
+///
+/// `CongeeArc` frees a removed or replaced value through crossbeam-epoch's
+/// deferred destruction: it clones the `Arc` and drops the clone only when a
+/// later pin collects that epoch's garbage — up to 64 objects per thread wait
+/// in a thread-local bag, and the global queue drains 8 bags per 128 pins.
+/// With multi-megabyte arrays as values, that kept every evicted entry alive
+/// for an unbounded, budget-invisible stretch: a tier reporting at its limit
+/// while the process held several times that.
+///
+/// Taking the slot out of the cell when the index gives it up means the
+/// deferred drop reclaims only an empty shell, and the array dies with the
+/// last caller-held reference.
+struct Cell {
+    slot: RwLock<Option<Arc<Slot>>>,
+}
+
+impl Cell {
+    fn new(slot: Slot) -> Self {
+        Self {
+            slot: RwLock::new(Some(Arc::new(slot))),
+        }
+    }
+
+    fn load(&self) -> Option<Arc<Slot>> {
+        self.slot.read().unwrap().clone()
+    }
+
+    fn take(&self) -> Option<Arc<Slot>> {
+        self.slot.write().unwrap().take()
+    }
+}
+
 pub(crate) struct ArtIndex {
-    art: CongeeArc<EntryID, Slot>,
+    art: CongeeArc<EntryID, Cell>,
     entry_count: AtomicUsize,
+    identity_mismatches: AtomicU64,
 }
 
 impl Debug for ArtIndex {
@@ -41,22 +77,42 @@ impl Debug for ArtIndex {
 
 impl ArtIndex {
     pub(crate) fn new() -> Self {
-        let art: CongeeArc<EntryID, Slot> = CongeeArc::new();
         Self {
-            art,
+            art: CongeeArc::new(),
             entry_count: AtomicUsize::new(0),
+            identity_mismatches: AtomicU64::new(0),
         }
     }
 
     /// The slot under `entry_id`, whichever identity holds it.
     pub(crate) fn get(&self, entry_id: &EntryID) -> Option<Arc<Slot>> {
         let guard = self.art.pin();
-        self.art.get(*entry_id, &guard)
+        // An empty cell means the slot was removed or replaced between the
+        // tree lookup and the load. A remove reading as a miss is as if it had
+        // won the race outright, but after a replace the key is still present
+        // under a new cell, so look it up once more rather than report a
+        // cached entry as absent.
+        let cell = self.art.get(*entry_id, &guard)?;
+        if let Some(slot) = cell.load() {
+            return Some(slot);
+        }
+        self.art.get(*entry_id, &guard)?.load()
     }
 
-    /// The slot under `entry_id`, only if `identity` holds it.
+    /// The slot under `entry_id`, only if `identity` holds it. A slot held by
+    /// another identity is counted in [`Self::identity_mismatches`].
     pub(crate) fn get_for(&self, entry_id: &EntryID, identity: u64) -> Option<Arc<Slot>> {
-        self.get(entry_id).filter(|slot| slot.belongs_to(identity))
+        let slot = self.get(entry_id)?;
+        if !slot.belongs_to(identity) {
+            self.identity_mismatches.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(slot)
+    }
+
+    /// How many lookups found their key held by another identity.
+    pub(crate) fn identity_mismatches(&self) -> u64 {
+        self.identity_mismatches.load(Ordering::Relaxed)
     }
 
     pub(crate) fn contains(&self, entry_id: &EntryID, identity: u64) -> bool {
@@ -73,40 +129,37 @@ impl ArtIndex {
         };
         let existing = self
             .art
-            .insert(*entry_id, Arc::new(slot), &guard)
+            .insert(*entry_id, Arc::new(Cell::new(slot)), &guard)
             .expect("Insertion failed");
-        if existing.is_none() {
-            self.entry_count.fetch_add(1, Ordering::Relaxed);
+        match existing {
+            Some(replaced) => {
+                replaced.take();
+            }
+            None => {
+                self.entry_count.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
     pub(crate) fn remove(&self, entry_id: &EntryID) -> Option<Arc<Slot>> {
         let guard = self.art.pin();
-        let removed = self.art.remove(*entry_id, &guard);
-        if removed.is_some() {
-            self.entry_count.fetch_sub(1, Ordering::Relaxed);
-        }
-        removed
+        let removed = self.art.remove(*entry_id, &guard)?;
+        self.entry_count.fetch_sub(1, Ordering::Relaxed);
+        removed.take()
     }
 
     pub(crate) fn reset(&self) {
-        let guard = self.art.pin();
-        self.art.keys().into_iter().for_each(|k| {
-            _ = self.art.remove(k, &guard).unwrap();
-        });
+        for k in self.art.keys() {
+            self.remove(&k);
+        }
         self.entry_count.store(0, Ordering::Relaxed);
     }
 
     pub(crate) fn for_each(&self, mut f: impl FnMut(&EntryID, &Slot)) {
-        let guard = self.art.pin();
-        for id in self.art.keys().into_iter() {
-            f(
-                &id,
-                &self
-                    .art
-                    .get(id, &guard)
-                    .expect("Failed to get value from ART"),
-            );
+        for id in self.art.keys() {
+            if let Some(slot) = self.get(&id) {
+                f(&id, &slot);
+            }
         }
     }
 
@@ -173,6 +226,39 @@ mod tests {
         assert!(!store.contains(&entry_id, 0));
     }
 
+    /// The array behind a removed or replaced entry must die with the last
+    /// caller-held reference, not wait for epoch garbage collection.
+    #[test]
+    fn removed_and_replaced_entries_are_released_immediately() {
+        let store = ArtIndex::new();
+        let id = EntryID::from(1);
+
+        let first = create_test_array(100);
+        let CacheEntry::MemoryArrow(first_array) = &first else {
+            unreachable!()
+        };
+        let weak_first = Arc::downgrade(first_array);
+        store.insert(&id, 0, first);
+        store.insert(&id, 0, create_test_array(200));
+        assert!(
+            weak_first.upgrade().is_none(),
+            "replaced entry still alive: held by the index's deferred drop"
+        );
+
+        let second = store.get(&id).unwrap();
+        let removed = store.remove(&id).unwrap();
+        let CacheEntry::MemoryArrow(second_array) = &removed.entry else {
+            unreachable!()
+        };
+        let weak_second = Arc::downgrade(second_array);
+        drop((second, removed));
+        assert!(
+            weak_second.upgrade().is_none(),
+            "removed entry still alive: held by the index's deferred drop"
+        );
+        assert_eq!(store.entry_count(), 0);
+    }
+
     #[test]
     fn a_slot_is_visible_only_to_its_identity() {
         let store = ArtIndex::new();
@@ -182,6 +268,7 @@ mod tests {
         assert!(store.contains(&entry_id, 7));
         assert!(!store.contains(&entry_id, 8));
         assert!(store.get_for(&entry_id, 8).is_none());
+        assert_eq!(store.identity_mismatches(), 2);
 
         store.insert(&entry_id, 8, create_test_array(20));
         assert!(!store.contains(&entry_id, 7));
