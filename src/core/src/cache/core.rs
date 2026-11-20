@@ -68,9 +68,18 @@ pub struct LiquidCache {
     disk_key_locks: DiskKeyLocks,
     stray_objects: StrayObjects,
     evict_victims_concurrently: bool,
-    /// Whether an inserted byte array is transcoded to Liquid on a background
-    /// task ([`Self::transcode_text_in_background`]).
-    background_text: std::sync::atomic::AtomicBool,
+    /// The bounds on transcoding inserted byte arrays to Liquid in the
+    /// background, once turned on ([`Self::transcode_text_in_background`]).
+    background_text: std::sync::OnceLock<Transcodes>,
+}
+
+/// How many background transcodes may run, and how many more may wait.
+#[derive(Debug)]
+pub(crate) struct Transcodes {
+    /// Permits to run: at most this many blocking threads transcode at once.
+    pub(crate) running: Arc<tokio::sync::Semaphore>,
+    /// Permits to be queued or running. An array that finds none stays Arrow.
+    pub(crate) taken: Arc<tokio::sync::Semaphore>,
 }
 
 /// Orders the store operations on one key.
@@ -337,15 +346,18 @@ impl LiquidCache {
     /// Insert byte arrays (text and binary) as Arrow, then transcode each to
     /// Liquid on a background task and swap it in if the slot still holds
     /// that array. The insert, and so the query that read the array, never
-    /// pays for the transcode. Off by default.
-    pub fn transcode_text_in_background(&self, on: bool) {
-        self.background_text
-            .store(on, std::sync::atomic::Ordering::Relaxed);
+    /// pays for the transcode. At most `workers` transcode at once and
+    /// `queued` more wait; an array inserted while that many are taken stays
+    /// Arrow. Off by default; the first call sets the bounds.
+    pub fn transcode_text_in_background(&self, workers: usize, queued: usize) {
+        let _ = self.background_text.set(Transcodes {
+            running: Arc::new(tokio::sync::Semaphore::new(workers)),
+            taken: Arc::new(tokio::sync::Semaphore::new(workers + queued)),
+        });
     }
 
-    pub(crate) fn background_text(&self) -> bool {
-        self.background_text
-            .load(std::sync::atomic::Ordering::Relaxed)
+    pub(crate) fn background_text(&self) -> Option<&Transcodes> {
+        self.background_text.get()
     }
 
     /// Replace `entry_id`'s Arrow `array` by `liquid`, if its slot still holds
@@ -792,7 +804,7 @@ impl LiquidCache {
             disk_key_locks: DiskKeyLocks::new(),
             stray_objects: StrayObjects::default(),
             evict_victims_concurrently,
-            background_text: std::sync::atomic::AtomicBool::new(false),
+            background_text: std::sync::OnceLock::new(),
         }
     }
 

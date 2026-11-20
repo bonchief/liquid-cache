@@ -235,7 +235,16 @@ impl<'a> Insert<'a> {
         if let Some(lineage) = self.lineage {
             self.storage.add_lineage(&self.entry_id, lineage);
         }
-        let text = self.storage.background_text() && is_bytes(batch.data_type());
+        // A slot to transcode in the background, taken now: without one the
+        // array stays Arrow and nothing waits on it.
+        let slot = self
+            .storage
+            .background_text()
+            .filter(|_| is_bytes(batch.data_type()))
+            .and_then(|transcodes| {
+                let taken = Arc::clone(&transcodes.taken).try_acquire_owned().ok()?;
+                Some((taken, Arc::clone(&transcodes.running)))
+            });
         self.storage
             .insert_inner(
                 self.entry_id,
@@ -243,10 +252,16 @@ impl<'a> Insert<'a> {
                 CacheEntry::memory_arrow(Arc::clone(&batch)),
             )
             .await?;
-        if text && let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        if let Some((taken, running)) = slot
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
             let storage = Arc::clone(self.storage);
             let (entry_id, identity) = (self.entry_id, self.identity);
             runtime.spawn(async move {
+                let _taken = taken;
+                let Ok(_running) = running.acquire_owned().await else {
+                    return;
+                };
                 let arrow = Arc::clone(&batch);
                 let liquid = tokio::task::spawn_blocking(move || {
                     crate::liquid_array::LiquidArray::from_arrow_array(&arrow).ok()
