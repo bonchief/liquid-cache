@@ -7,7 +7,7 @@ mod core;
 mod expressions;
 mod index;
 mod io_context;
-mod liquid_expr;
+pub(crate) mod liquid_expr;
 mod observer;
 pub mod policies;
 mod utils;

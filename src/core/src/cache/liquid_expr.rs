@@ -2,7 +2,8 @@ use arrow_schema::DataType;
 use datafusion_common::ScalarValue;
 use datafusion_expr_common::operator::Operator;
 use datafusion_physical_expr::expressions::{
-    BinaryExpr, CastExpr, Column, DynamicFilterPhysicalExpr, LikeExpr, Literal, TryCastExpr,
+    BinaryExpr, CastExpr, Column, DynamicFilterPhysicalExpr, LikeExpr, Literal, NotExpr,
+    TryCastExpr,
 };
 use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 
@@ -58,6 +59,15 @@ fn supports_expr(expr: &Arc<dyn PhysicalExpr>, data_type: &DataType) -> bool {
 
     if let Some(like_expr) = expr.downcast_ref::<LikeExpr>() {
         return supports_like_expr(like_expr, data_type);
+    }
+
+    if let Some(not) = expr.downcast_ref::<NotExpr>()
+        && search(not.arg()).is_some()
+    {
+        return is_byte_like(data_type);
+    }
+    if search(expr).is_some() {
+        return is_byte_like(data_type);
     }
 
     if let Some(literal) = expr.downcast_ref::<Literal>() {
@@ -116,6 +126,34 @@ fn supports_like_expr(like_expr: &LikeExpr, data_type: &DataType) -> bool {
         .downcast_ref::<Literal>()
         .and_then(|literal| get_bytes_needle(literal.value()))
         .is_some()
+}
+
+/// A byte search on a column and a literal needle, as the LIKE pattern it
+/// means: `binary_contains(c, 'x')` is `c LIKE '%x%'`, `binary_starts_with`
+/// is `'x%'` and `binary_ends_with` is `'%x'`, with `%`, `_` and `\\` in the
+/// needle escaped. These are the byte forms Bonchief rewrites LIKE on binary
+/// text to, so an encoded entry can run them as its own LIKE.
+pub(crate) fn search(expr: &Arc<dyn PhysicalExpr>) -> Option<String> {
+    let func = expr.downcast_ref::<ScalarFunctionExpr>()?;
+    let [value, needle] = func.args() else {
+        return None;
+    };
+    value.downcast_ref::<Column>()?;
+    let needle = get_bytes_needle(needle.downcast_ref::<Literal>()?.value())?;
+    let needle = String::from_utf8(needle).ok()?;
+    let mut escaped = String::with_capacity(needle.len());
+    for c in needle.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    match func.name() {
+        "binary_contains" => Some(format!("%{escaped}%")),
+        "binary_starts_with" => Some(format!("{escaped}%")),
+        "binary_ends_with" => Some(format!("%{escaped}")),
+        _ => None,
+    }
 }
 
 fn is_column_like(expr: &Arc<dyn PhysicalExpr>) -> bool {

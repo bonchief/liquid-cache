@@ -7,10 +7,11 @@ use arrow_schema::{DataType, Field};
 use bytes::Bytes;
 use datafusion_common::ScalarValue;
 use datafusion_expr_common::operator::Operator as DataFusionOperator;
-use datafusion_physical_expr::expressions::{BinaryExpr, Column, LikeExpr, Literal};
+use datafusion_physical_expr::expressions::{BinaryExpr, Column, LikeExpr, Literal, NotExpr};
 use vortex_array::arrays::ConstantArray;
 use vortex_array::builtins::ArrayBuiltins;
-use vortex_array::dtype::DType;
+use vortex_array::dtype::{DType, Nullability};
+use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::like::{Like, LikeOptions};
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::serde::{SerializeOptions, SerializedArray};
@@ -291,6 +292,25 @@ impl LiquidArray {
                 ),
                 _ => None,
             };
+        }
+
+        let (negated, inner) = match expr.downcast_ref::<NotExpr>() {
+            Some(not) => (true, not.arg()),
+            None => (false, expr),
+        };
+        if let Some(pattern) = crate::cache::liquid_expr::search(inner) {
+            let pattern =
+                ConstantArray::new(Scalar::utf8(pattern, Nullability::NonNullable), array.len())
+                    .into_array();
+            let options = LikeOptions {
+                negated,
+                case_insensitive: false,
+            };
+            return Some(
+                Like::try_new(array.clone(), pattern, options)
+                    .ok()?
+                    .into_array(),
+            );
         }
 
         if let Some(like) = expr.downcast_ref::<LikeExpr>() {
