@@ -117,10 +117,8 @@ impl Morselizer for LiquidMorselizer {
         let file_name = partitioned_file.object_meta.location.to_string();
         let metrics = LiquidFileMetrics::new(self.partition_index, &file_name, &self.metrics);
         let metadata_size_hint = partitioned_file.metadata_size_hint;
-        let file_identity = ParquetFileIdentity::of(
-            self.object_store_url.clone(),
-            &partitioned_file.object_meta,
-        );
+        let file_identity =
+            ParquetFileIdentity::of(self.object_store_url.clone(), &partitioned_file.object_meta);
         let reader_factory = Arc::new(LiquidFileReaderFactory {
             factory: Arc::clone(&self.parquet_file_reader_factory),
             partition_index: self.partition_index,
@@ -250,7 +248,9 @@ struct PreparedLiquidOpen {
 struct MetadataLoadedLiquidOpen {
     prepared: Box<PreparedLiquidOpen>,
     reader_metadata: ArrowReaderMetadata,
-    options: ArrowReaderOptions,
+    /// The reader the footer was loaded through, reused for the stream: a
+    /// second reader per file costs another set of file metrics.
+    reader: ParquetInput,
 }
 
 struct PreparedRowGroups {
@@ -333,12 +333,12 @@ impl LiquidOpenState {
                         let mut timer = metadata_load_time.timer();
                         let mut reader = prepared.reader_factory.create()?;
                         let reader_metadata =
-                            ArrowReaderMetadata::load_async(&mut reader, options.clone()).await?;
+                            ArrowReaderMetadata::load_async(&mut reader, options).await?;
                         timer.stop();
                         Ok(MetadataLoadedLiquidOpen {
                             prepared,
                             reader_metadata,
-                            options,
+                            reader,
                         })
                     }
                     .boxed(),
@@ -377,13 +377,6 @@ fn prepare_and_prune_by_stats(mut loaded: MetadataLoadedLiquidOpen) -> Result<Li
     let mut metadata_timer = metadata_load_time.timer();
     let physical_file_schema = Arc::clone(loaded.reader_metadata.schema());
     let cache_full_schema = Arc::clone(&physical_file_schema);
-    loaded.options = loaded
-        .options
-        .with_schema(Arc::clone(&physical_file_schema));
-    loaded.reader_metadata = ArrowReaderMetadata::try_new(
-        Arc::clone(loaded.reader_metadata.metadata()),
-        loaded.options,
-    )?;
     let rewriter = loaded.prepared.expr_adapter_factory.create(
         Arc::clone(&loaded.prepared.logical_file_schema),
         Arc::clone(&physical_file_schema),
@@ -407,7 +400,7 @@ fn prepare_and_prune_by_stats(mut loaded: MetadataLoadedLiquidOpen) -> Result<Li
     );
     metadata_timer.stop();
     let builder = ParquetRecordBatchStreamBuilder::new_with_metadata(
-        loaded.prepared.reader_factory.create()?,
+        loaded.reader,
         loaded.reader_metadata.clone(),
     );
     let projection_mask = ProjectionMask::roots(
