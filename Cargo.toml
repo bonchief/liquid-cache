@@ -35,12 +35,12 @@ parquet = { version = "60.1.0", features = [
 	"variant_experimental",
 ] }
 parquet-variant-json = { version = "60.1.0" }
-datafusion = { git = "https://github.com/bonchief/datafusion.git", rev = "a34af9e14b6db55ff1e453b6a1432679785c9dc4" }
-datafusion-datasource = { git = "https://github.com/bonchief/datafusion.git", rev = "a34af9e14b6db55ff1e453b6a1432679785c9dc4" }
-datafusion-common = { git = "https://github.com/bonchief/datafusion.git", rev = "a34af9e14b6db55ff1e453b6a1432679785c9dc4" }
-datafusion-expr-common = { git = "https://github.com/bonchief/datafusion.git", rev = "a34af9e14b6db55ff1e453b6a1432679785c9dc4" }
-datafusion-physical-expr = { git = "https://github.com/bonchief/datafusion.git", rev = "a34af9e14b6db55ff1e453b6a1432679785c9dc4" }
-datafusion-proto = { git = "https://github.com/bonchief/datafusion.git", rev = "a34af9e14b6db55ff1e453b6a1432679785c9dc4" }
+datafusion = { git = "https://github.com/bonchief/datafusion.git", rev = "69e4b585d928619b9200475c74e5dfabd8193df3" }
+datafusion-datasource = { git = "https://github.com/bonchief/datafusion.git", rev = "69e4b585d928619b9200475c74e5dfabd8193df3" }
+datafusion-common = { git = "https://github.com/bonchief/datafusion.git", rev = "69e4b585d928619b9200475c74e5dfabd8193df3" }
+datafusion-expr-common = { git = "https://github.com/bonchief/datafusion.git", rev = "69e4b585d928619b9200475c74e5dfabd8193df3" }
+datafusion-physical-expr = { git = "https://github.com/bonchief/datafusion.git", rev = "69e4b585d928619b9200475c74e5dfabd8193df3" }
+datafusion-proto = { git = "https://github.com/bonchief/datafusion.git", rev = "69e4b585d928619b9200475c74e5dfabd8193df3" }
 async-trait = "0.1.89"
 futures = { version = "0.3.32", default-features = false, features = ["std"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread"] }
