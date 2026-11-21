@@ -447,13 +447,23 @@ impl CachedFile {
         row_group_id: u64,
         predicate_column_ids: Vec<usize>,
     ) -> CachedRowGroupRef {
-        self.create_row_group_with_snapshots(row_group_id, predicate_column_ids, Arc::default())
+        self.create_row_group_with_snapshots(
+            row_group_id,
+            predicate_column_ids,
+            None,
+            Arc::default(),
+        )
     }
 
+    /// A row group holding only `read` of the file's columns, by their index
+    /// in the file schema, or every column when `read` is `None`. A read
+    /// builds handles for the columns it touches alone, not for every
+    /// column of a wide file.
     pub(crate) fn create_row_group_with_snapshots(
         &self,
         row_group_id: u64,
         predicate_column_ids: Vec<usize>,
+        read: Option<&[usize]>,
         snapshots: Arc<RowGroupSnapshots>,
     ) -> CachedRowGroupRef {
         let columns: Vec<CachedColumnSpec> = self
@@ -461,6 +471,7 @@ impl CachedFile {
             .fields()
             .iter()
             .enumerate()
+            .filter(|(idx, _)| read.is_none_or(|read| read.contains(idx)))
             .map(|(idx, field)| {
                 let is_predicate_column = predicate_column_ids.contains(&idx);
                 let expression = self.lineages.get(field.name()).cloned();

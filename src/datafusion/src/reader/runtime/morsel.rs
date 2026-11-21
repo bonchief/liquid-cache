@@ -1,4 +1,4 @@
-use std::{fmt, pin::Pin, sync::Arc};
+use std::{fmt, pin::Pin, sync::Arc, task::Poll};
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::{Schema, SchemaRef};
@@ -111,6 +111,7 @@ impl LiquidRowGroupPlanner {
         let cached_row_group = self.cached_file.create_row_group_with_snapshots(
             row_group_idx as u64,
             details.predicate_column_ids.clone(),
+            Some(&details.cache_column_ids),
             snapshots,
         );
         let fallback = ParquetFallback::new(self.fallback_config(
@@ -148,6 +149,7 @@ impl LiquidRowGroupPlanner {
         let cached_row_group = self.cached_file.create_row_group_with_snapshots(
             row_group_idx as u64,
             details.predicate_column_ids.clone(),
+            Some(&details.cache_column_ids),
             snapshots,
         );
         let cache_batch_size = cached_row_group.batch_size();
@@ -282,10 +284,50 @@ impl Morsel for LiquidRowGroupMorsel {
             replace_schema,
             span,
         } = *self;
+        // A filtered read emits one batch per cached batch, however few of
+        // its rows pass; they are coalesced to the cache's batch size, as a
+        // Parquet read with a row filter fills its batches, so the operators
+        // above see as many batches either way. One already at least half
+        // full passes through uncopied.
+        let size = config.cached_row_group.batch_size();
         let mut reader = LiquidCacheReader::new(config);
+        let mut coalescer: Option<arrow::compute::BatchCoalescer> = None;
+        let mut done = false;
         let stream = futures::stream::poll_fn(move |cx| {
             let _guard = span.as_ref().map(|span| span.set_local_parent());
-            Pin::new(&mut reader).poll_next(cx)
+            loop {
+                if let Some(batch) = coalescer.as_mut().and_then(|c| c.next_completed_batch()) {
+                    return Poll::Ready(Some(Ok(batch)));
+                }
+                if done {
+                    return Poll::Ready(None);
+                }
+                match Pin::new(&mut reader).poll_next(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    // A batch without columns carries only its row count.
+                    Poll::Ready(Some(Ok(batch))) if batch.num_columns() == 0 => {
+                        return Poll::Ready(Some(Ok(batch)));
+                    }
+                    Poll::Ready(Some(Ok(batch))) => {
+                        let coalescer = coalescer.get_or_insert_with(|| {
+                            arrow::compute::BatchCoalescer::new(batch.schema(), size)
+                                .with_biggest_coalesce_batch_size(Some(size / 2))
+                        });
+                        if let Err(error) = coalescer.push_batch(batch) {
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                    }
+                    Poll::Ready(Some(Err(error))) => return Poll::Ready(Some(Err(error))),
+                    Poll::Ready(None) => {
+                        done = true;
+                        if let Some(Err(error)) =
+                            coalescer.as_mut().map(|c| c.finish_buffered_batch())
+                        {
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                    }
+                }
+            }
         });
 
         stream
