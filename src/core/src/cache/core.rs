@@ -289,6 +289,24 @@ pub(super) fn same_memory_entry(slot: &CacheEntry, observed: &CacheEntry) -> boo
 
 /// Builder returned by [`LiquidCache::insert`] for configuring cache writes.
 impl LiquidCache {
+    /// Call `each` with every entry held in memory, its form and the bytes
+    /// the budget charges it, so a caller can split what the cache holds by
+    /// its own key. It walks the whole index.
+    pub fn for_each_in_memory(&self, mut each: impl FnMut(&EntryID, CachedBatchType, usize)) {
+        self.index.for_each(|entry_id, slot| {
+            if matches!(
+                slot.entry,
+                CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_)
+            ) {
+                each(
+                    entry_id,
+                    CachedBatchType::from(&slot.entry),
+                    slot.entry.memory_usage_bytes(),
+                );
+            }
+        });
+    }
+
     /// Return current cache statistics: counts and resource usage.
     pub fn stats(&self) -> CacheStats {
         // Count entries by storage tier and format
