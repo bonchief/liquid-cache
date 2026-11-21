@@ -555,6 +555,15 @@ impl LiquidCache {
         }
     }
 
+    /// Evict `entries`, each the way an insert's victim goes, through the
+    /// squeeze policy. For an owner that knows some entries are of no use,
+    /// such as part of a read it could not hold whole.
+    pub async fn evict(&self, entries: Vec<EntryID>) {
+        if !entries.is_empty() {
+            self.evict_victims(entries).await;
+        }
+    }
+
     /// Reset the cache.
     pub fn reset(&self) {
         self.index.reset();
