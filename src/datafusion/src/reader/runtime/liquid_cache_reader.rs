@@ -70,6 +70,9 @@ pub(crate) struct LiquidCacheReaderConfig {
 pub(crate) struct ParquetFallbackConfig {
     pub(crate) row_group_idx: usize,
     pub(crate) metadata: Arc<ParquetMetaData>,
+    /// The file's columns as the scan reads them (views where the table
+    /// reads views), which the cache holds.
+    pub(crate) file_schema: SchemaRef,
     pub(crate) reader_factory: Arc<LiquidFileReaderFactory>,
     pub(crate) cache_projection: ProjectionMask,
     pub(crate) cache_column_ids: Vec<usize>,
@@ -80,6 +83,7 @@ pub(crate) struct ParquetFallbackConfig {
 pub(crate) struct ParquetFallback {
     row_group_idx: usize,
     metadata: Arc<ParquetMetaData>,
+    file_schema: SchemaRef,
     reader_factory: Arc<LiquidFileReaderFactory>,
     cache_projection: ProjectionMask,
     cache_column_ids: Vec<usize>,
@@ -165,6 +169,7 @@ impl ParquetFallback {
         Self {
             row_group_idx: config.row_group_idx,
             metadata: config.metadata,
+            file_schema: config.file_schema,
             reader_factory: config.reader_factory,
             cache_projection: config.cache_projection,
             cache_column_ids: config.cache_column_ids,
@@ -197,8 +202,10 @@ impl ParquetFallback {
     }
 
     fn rebuild_stream(&mut self, batch_id: BatchID) -> Result<(), ParquetError> {
-        let reader_metadata =
-            ArrowReaderMetadata::try_new(Arc::clone(&self.metadata), ArrowReaderOptions::new())?;
+        let reader_metadata = ArrowReaderMetadata::try_new(
+            Arc::clone(&self.metadata),
+            ArrowReaderOptions::new().with_schema(Arc::clone(&self.file_schema)),
+        )?;
         let row_selection =
             build_row_selection_from(batch_id, self.cache_batch_size, self.row_count);
 

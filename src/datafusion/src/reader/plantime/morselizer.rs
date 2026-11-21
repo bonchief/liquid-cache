@@ -375,7 +375,25 @@ fn prepare_and_prune_by_stats(mut loaded: MetadataLoadedLiquidOpen) -> Result<Li
         .metadata_load_time
         .clone();
     let mut metadata_timer = metadata_load_time.timer();
-    let physical_file_schema = Arc::clone(loaded.reader_metadata.schema());
+    let mut physical_file_schema = Arc::clone(loaded.reader_metadata.schema());
+    // Read the file's columns as the table types them, as DataFusion's own
+    // opener does: Binary and Utf8 decode straight to their views when the
+    // table reads views, so the cache holds that type and a predicate on the
+    // column stays a bare column, not a cast of it.
+    if let Some(merged) =
+        datafusion::datasource::physical_plan::parquet::apply_file_schema_type_coercions(
+            &loaded.prepared.logical_file_schema,
+            &physical_file_schema,
+        )
+    {
+        physical_file_schema = Arc::new(merged);
+        loaded.reader_metadata = ArrowReaderMetadata::try_new(
+            Arc::clone(loaded.reader_metadata.metadata()),
+            ArrowReaderOptions::new()
+                .with_page_index_policy(PageIndexPolicy::Required)
+                .with_schema(Arc::clone(&physical_file_schema)),
+        )?;
+    }
     let cache_full_schema = Arc::clone(&physical_file_schema);
     let rewriter = loaded.prepared.expr_adapter_factory.create(
         Arc::clone(&loaded.prepared.logical_file_schema),

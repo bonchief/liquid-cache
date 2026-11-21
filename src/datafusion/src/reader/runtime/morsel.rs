@@ -79,6 +79,7 @@ impl LiquidRowGroupPlanner {
         ParquetFallbackConfig {
             row_group_idx,
             metadata: Arc::clone(&self.metadata),
+            file_schema: self.cached_file.schema(),
             reader_factory: Arc::clone(&self.reader_factory),
             cache_projection: details.cache_projection.clone(),
             cache_column_ids: details.cache_column_ids.clone(),
