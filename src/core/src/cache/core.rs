@@ -522,6 +522,21 @@ impl LiquidCache {
         self.index.for_each(|_, slot| f(slot.identity));
     }
 
+    /// Evict what the policy offers until memory holds at most `bytes`, or
+    /// the policy offers nothing more. Each victim goes the way an insert's
+    /// victim goes, through the squeeze policy, so the budget stays exact
+    /// while inserts and reads go on. For an owner that must give memory
+    /// back.
+    pub async fn shrink(&self, bytes: usize) {
+        while self.budget.memory_usage_bytes() > bytes {
+            let victims = self.cache_policy.find_memory_victim(Self::MAX_MEMORY_VICTIMS);
+            if victims.is_empty() {
+                break;
+            }
+            self.evict_victims(victims).await;
+        }
+    }
+
     /// Reset the cache.
     pub fn reset(&self) {
         self.index.reset();
