@@ -1501,14 +1501,18 @@ impl LiquidCache {
 
         match entry {
             CacheEntry::MemoryArrow(array) => {
-                let mut owned = None;
-                let selection = selection_opt.unwrap_or_else(|| {
-                    owned = Some(BooleanBuffer::new_set(array.len()));
-                    owned.as_ref().unwrap()
-                });
-                let selection_array = BooleanArray::new(selection.clone(), None);
-                let filtered = arrow::compute::filter(array, &selection_array)
-                    .expect("selection must match array length");
+                // A selection of every row evaluates on the held array as it
+                // is, without copying it first.
+                let filtered = match selection_opt
+                    .filter(|selection| selection.count_set_bits() < array.len())
+                {
+                    Some(selection) => {
+                        let selection_array = BooleanArray::new(selection.clone(), None);
+                        arrow::compute::filter(array, &selection_array)
+                            .expect("selection must match array length")
+                    }
+                    None => Arc::clone(array),
+                };
                 Some(self.eval_predicate_on_array(filtered, predicate))
             }
             entry @ CacheEntry::DiskArrow { .. } => {
