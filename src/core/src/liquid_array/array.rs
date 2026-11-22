@@ -811,7 +811,11 @@ mod tests {
             array.data_type(),
         );
         assert!(vortex.try_eval_predicate(&expr, &short).is_err());
-        assert!(vortex.try_eval_predicate(&expr, &BooleanBuffer::new_set(4)).is_ok());
+        assert!(
+            vortex
+                .try_eval_predicate(&expr, &BooleanBuffer::new_set(4))
+                .is_ok()
+        );
     }
 
     fn comparison_expr(
