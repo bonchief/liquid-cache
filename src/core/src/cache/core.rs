@@ -3005,6 +3005,7 @@ mod tests {
                 .with_max_memory_bytes(1 << 20)
                 .with_max_disk_bytes(disk_bytes)
                 .with_eviction_policy(Box::new(TranscodeEvict))
+                .with_hydration_policy(Box::new(AlwaysHydrate::new()))
                 .with_cache_policy(Box::new(HookAfterDiskVictims {
                     inner: LiquidPolicy::new(),
                     hook: hook.clone(),
@@ -3746,7 +3747,9 @@ mod tests {
     #[test]
     fn a_failed_flush_leaves_a_record_another_writer_spilled() {
         let entry = EntryID::from(943usize);
-        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        // Long enough that its Liquid form takes fewer disk pages than its
+        // Arrow form: objects are charged whole pages.
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..4096));
         let directory = tempfile::tempdir().unwrap();
         let store = DiskStore::mount(
             directory.path().join("cache.disk"),
@@ -4261,10 +4264,10 @@ mod tests {
     async fn a_transcoded_entry_keeps_its_snapshotted_arrow_charged() {
         let cache = memory_only_cache(1 << 20).await;
         let entry_id = EntryID::from(0usize);
-        cache
-            .insert(entry_id, 0, int64_array(4096, 0))
-            .await
-            .unwrap();
+        // Values that pack smaller as Liquid, so the eviction transcodes
+        // rather than drops (see `TranscodeEvict`).
+        let array: ArrayRef = Arc::new(Int64Array::from_iter_values(0..4096));
+        cache.insert(entry_id, 0, array).await.unwrap();
         let held = snapshot(&cache, entry_id).await;
 
         cache.evict_chunk(&[entry_id]).await;

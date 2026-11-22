@@ -1316,8 +1316,9 @@ mod tests {
             prefetch: options.prefetch,
             fill: true,
         };
+        // Registered under the identity the morselizer reads the file by.
         let cached_file = cache.register_or_get_file(
-            ParquetFileIdentity::new(object_store_url, file_name),
+            ParquetFileIdentity::of(object_store_url, &partitioned_file.object_meta),
             schema,
         );
         TestFilePlanner {
@@ -1365,10 +1366,12 @@ mod tests {
         let tmp_dir = tempfile::tempdir().unwrap();
         let parquet_path = tmp_dir.path().join("data.parquet");
         write_two_row_group_file(&parquet_path, Arc::clone(&schema));
-        let file = PartitionedFile::new(
+        let mut file = PartitionedFile::new(
             "data.parquet",
             std::fs::metadata(&parquet_path).unwrap().len(),
         );
+        // Marked held, so the source sends it to the cache reader.
+        file.extensions.insert(crate::reader::Held);
         let object_store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).unwrap());
         let metadata_cache = RuntimeEnv::default()
@@ -1703,19 +1706,21 @@ mod tests {
         file.cache.flush_data().await.unwrap();
 
         let chain = advance_to_row_group_chain(file.planner).await;
+        // A prefetch reads disk batches into the read's snapshots, never
+        // back into the cache: every batch stays on disk.
         let projection = row_group.get_column(1).unwrap();
-        for batch_idx in 0..2 {
+        for batch_idx in 0..3 {
             let entry_id = projection.entry_id(BatchID::from_raw(batch_idx)).into();
             assert_eq!(
                 kind_of(file.cache.storage(), &entry_id),
                 Some(CachedBatchType::DiskArrow)
             );
         }
-        let surviving_entry = projection.entry_id(BatchID::from_raw(2)).into();
-        assert_eq!(
-            kind_of(file.cache.storage(), &surviving_entry),
-            Some(CachedBatchType::MemoryArrow)
-        );
+        // The predicate column's three batches, read with their chunk, and
+        // the projection's one surviving batch: the filtered batches'
+        // projection was never read.
+        let (_, snapshotted, _) = crate::cache::snapshot_test_registry::live_totals();
+        assert_eq!(snapshotted, 4);
 
         let morsels = chain.plan().unwrap().unwrap().take_morsels();
         assert_eq!(
@@ -2319,9 +2324,14 @@ mod tests {
 
         file.cache.flush_data().await.unwrap();
 
-        assert_eq!(file.cache.memory_usage_bytes(), snapshot_bytes);
+        // Each disk record is charged its fixed metadata share of memory.
+        let stats = file.cache.storage().stats();
+        let records = (stats.disk_arrow_entries + stats.disk_liquid_entries)
+            * liquid_cache::cache::CacheEntry::DISK_RECORD_BYTES;
+        assert!(records > 0, "the flush put nothing on disk");
+        assert_eq!(file.cache.memory_usage_bytes(), snapshot_bytes + records);
         drop(chain);
-        assert_eq!(file.cache.memory_usage_bytes(), 0);
+        assert_eq!(file.cache.memory_usage_bytes(), records);
     }
 
     async fn drain_morsels(morsels: Vec<Box<dyn Morsel>>) -> usize {
