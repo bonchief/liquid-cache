@@ -12,14 +12,15 @@
 //! # Layout
 //!
 //! An object is one extent: a 64-byte `Header` and the payload right after
-//! it, padded to a whole number of pages. Extents are variable-length and
-//! contiguous, so a later step that stores every batch of one column chunk
-//! together needs no change here: it puts the chunk as one object keyed by
-//! the chunk (the entry id with its batch bits masked), with a table of the
-//! batches' offsets at the start of its payload, and reads the chunk back in
-//! one `pread` of one extent. Nothing in the layout ties an object to one
-//! batch.
+//! it, padded to a whole number of pages. The payload holds one column
+//! chunk's batches, or as many of them as were written together: a
+//! directory naming each batch's entry, form, offset and length, then the
+//! batches' bytes (see `chunk`). The object is keyed by the chunk (the entry
+//! id with its batch bits cleared) and every batch's entry names the same
+//! extent, so a read of any of them fetches the whole chunk in one `pread`,
+//! and the extent is freed once no entry names it and no read pins it.
 
+mod chunk;
 mod extents;
 mod io;
 
@@ -33,6 +34,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use bytes::Bytes;
 
 use crate::cache::utils::EntryID;
+use chunk::Directory;
+pub use chunk::{ChunkObject, StoredBatch};
 use extents::{Extents, PAGE};
 use io::{PageBuffer, Pool};
 
@@ -129,8 +132,10 @@ impl Default for DiskOptions {
     }
 }
 
-/// Which object a put or get is for: the entry it is stored under, and the
-/// identity of the source it was cached for.
+/// Which object a put or get is for: the chunk it holds batches of (the
+/// entry id with its batch bits cleared), and the identity of the source it
+/// was cached for. Both are written in the object's header and checked on
+/// every read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObjectKey {
     entry: EntryID,
@@ -138,9 +143,12 @@ pub struct ObjectKey {
 }
 
 impl ObjectKey {
-    /// The object of `entry` cached for `identity`.
-    pub fn new(entry: EntryID, identity: u64) -> Self {
-        Self { entry, identity }
+    /// The object of `chunk` cached for `identity`.
+    pub fn new(chunk: EntryID, identity: u64) -> Self {
+        Self {
+            entry: chunk,
+            identity,
+        }
     }
 }
 
@@ -154,13 +162,20 @@ impl ObjectKey {
 /// - **Each object is charged what it takes.** [`Self::footprint`] is the
 ///   extent an object of a given payload occupies, header and padding
 ///   included.
-/// - **A read returns only its own object's bytes.** It returns a payload
-///   only if the extent's header names the requested entry and identity, and
-///   the payload's length and xxh3 match the header. Any other outcome is an
-///   error, and [`Self::mismatches`] counts those whose header did not match.
+/// - **A read returns only its own object's bytes.** It returns an object
+///   only if the extent's header names the requested chunk and identity, the
+///   payload's length and xxh3 match the header, and the payload's directory
+///   lists the entry asked for. Any other outcome is an error, and
+///   [`Self::mismatches`] counts those whose header or directory did not
+///   match.
 /// - **No reuse under a read.** A read pins its extent from the index lookup
-///   until the `pread` is done, even if the caller drops the read; a removed
-///   or replaced object's extent is freed only when its last pin goes.
+///   until the `pread` is done, even if the caller drops the read; an
+///   extent is freed only once no entry names it and its last pin goes.
+/// - **Shared extents.** Every batch of an object names its extent. Removing
+///   one batch's entry leaves the extent to the others; its disk budget
+///   share, which the cache releases with the batch's record, is then
+///   counted free while the extent still takes it, until the chunk's other
+///   batches go. The file's length still bounds what the store holds.
 #[derive(Clone, Debug)]
 pub struct DiskStore {
     shared: Arc<Shared>,
@@ -204,14 +219,28 @@ impl DiskStore {
             .saturating_mul(page)
     }
 
-    /// Store `payload` as `key`'s object, replacing what its entry held.
+    /// The bytes an object holding batches of `lens` bytes takes in the
+    /// file: its header, directory and batches, rounded up to whole pages.
+    /// `None` past what an object can address.
+    pub fn chunk_footprint(lens: impl ExactSizeIterator<Item = usize>) -> Option<usize> {
+        Directory::payload_len(lens).map(Self::footprint)
+    }
+
+    /// Store `batches` as one object of `chunk`, in one extent, and name it
+    /// as each batch's entry's object, replacing what each entry named.
     ///
-    /// The object is written into a fresh extent, never over the entry's
-    /// current one, and the entry is pointed at it only once the write
-    /// succeeds. A failed or dropped put leaves the entry's previous object
-    /// as it was and frees its extent.
-    pub async fn put(&self, key: ObjectKey, payload: Bytes) -> Result<(), DiskError> {
-        let len = Self::footprint(payload.len());
+    /// The object is written into a fresh extent, never over a current one,
+    /// and the entries are pointed at it only once the write succeeds. A
+    /// failed or dropped put leaves every entry's previous object as it was
+    /// and frees its extent.
+    pub async fn put_chunk(
+        &self,
+        chunk: ObjectKey,
+        batches: Vec<StoredBatch>,
+    ) -> Result<(), DiskError> {
+        let len = Self::chunk_footprint(batches.iter().map(|batch| batch.bytes().len()))
+            .ok_or(DiskError::Full)?;
+        let entries: Vec<EntryID> = batches.iter().map(StoredBatch::entry).collect();
         let at = u64::try_from(len)
             .ok()
             .and_then(|len| self.shared.extents().allocate(len))
@@ -225,20 +254,30 @@ impl DiskStore {
         self.pool
             .run(move || {
                 let _writing = writing;
-                shared.write(key, &payload, at, len)
+                shared.write(chunk, &batches, at, len)
             })
             .await??;
-        self.shared.extents().name(key.entry, at);
+        {
+            let mut extents = self.shared.extents();
+            for entry in entries {
+                extents.name(entry, at);
+            }
+        }
         drop(hold);
         Ok(())
     }
 
-    /// The payload of `key`'s object.
-    pub async fn get(&self, key: ObjectKey) -> Result<Bytes, DiskError> {
+    /// The object `entry` names, read whole in one `pread`, if it is
+    /// `chunk`'s and lists `entry`.
+    pub async fn get_chunk(
+        &self,
+        entry: EntryID,
+        chunk: ObjectKey,
+    ) -> Result<ChunkObject, DiskError> {
         let (at, len) = self
             .shared
             .extents()
-            .pin_named(&key.entry)
+            .pin_named(&entry)
             .ok_or(DiskError::NotFound)?;
         let hold = Hold {
             shared: Arc::clone(&self.shared),
@@ -249,24 +288,32 @@ impl DiskStore {
             .pool
             .run(move || {
                 let _reading = hold;
-                shared.read(key, at, len)
+                shared.read(chunk, at, len)
             })
             .await??;
-        Ok(buffer.into_bytes(payload))
+        let payload = buffer.into_bytes(payload);
+        let directory = match Directory::read(&payload) {
+            Ok(directory) if directory.holds(&entry) => directory,
+            Ok(_) | Err(_) => {
+                self.shared.mismatches.fetch_add(1, Ordering::Relaxed);
+                return Err(DiskError::Corrupt);
+            }
+        };
+        Ok(ChunkObject::new(payload, directory))
     }
 
     /// Forget `entry`'s object; whether it had one. Its extent is freed once
-    /// no read pins it.
+    /// no other entry names it and no read pins it.
     pub fn remove(&self, entry: &EntryID) -> bool {
         self.shared.extents().remove(entry)
     }
 
-    /// How many objects the store holds.
+    /// How many entries name an object.
     pub fn len(&self) -> usize {
         self.shared.extents().len()
     }
 
-    /// Whether the store holds no object.
+    /// Whether no entry names an object.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -317,18 +364,24 @@ impl Shared {
         self.extents.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Write `key`'s header and `payload` into the extent of `len` bytes at
-    /// `at`. Runs on an I/O thread.
-    fn write(&self, key: ObjectKey, payload: &[u8], at: u64, len: usize) -> Result<(), DiskError> {
+    /// Write `key`'s header, and `batches` with their directory as its
+    /// payload, into the extent of `len` bytes at `at`. Runs on an I/O
+    /// thread.
+    fn write(
+        &self,
+        key: ObjectKey,
+        batches: &[StoredBatch],
+        at: u64,
+        len: usize,
+    ) -> Result<(), DiskError> {
         let mut buffer = PageBuffer::zeroed(len);
         let extent = buffer.as_mut_slice();
         let (head, body) = extent
             .split_at_mut_checked(Header::LEN)
             .ok_or(DiskError::Full)?;
+        let payload = Directory::write(batches, body)?;
+        let payload = body.get(..payload).ok_or(DiskError::Full)?;
         Header::of(key, payload).write(head);
-        body.get_mut(..payload.len())
-            .ok_or(DiskError::Full)?
-            .copy_from_slice(payload);
         self.file.write_all_at(buffer.as_slice(), at)?;
         if !self.direct {
             io::drop_written_pages(&self.file, at, len as u64)?;
@@ -385,9 +438,9 @@ impl Drop for Hold {
 /// The first [`Header::LEN`] bytes of an extent: what object it holds and how
 /// to check it.
 ///
-/// Layout, little-endian: magic (8 bytes), entry id (8), identity (8),
+/// Layout, little-endian: magic (8 bytes), chunk id (8), identity (8),
 /// payload length (8), xxh3-64 of the payload (8), then zeros. A read
-/// returns bytes only if the header's entry id, identity, length and
+/// returns bytes only if the header's chunk id, identity, length and
 /// checksum all match.
 struct Header {
     key: ObjectKey,
@@ -397,7 +450,7 @@ struct Header {
 
 impl Header {
     const LEN: usize = 64;
-    const MAGIC: [u8; 8] = *b"LQDISK01";
+    const MAGIC: [u8; 8] = *b"LQDISK02";
 
     fn of(key: ObjectKey, payload: &[u8]) -> Self {
         Self {

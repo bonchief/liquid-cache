@@ -23,6 +23,9 @@ pub(super) const PAGE: u64 = 4096;
 ///   a write pins it: a removed or replaced extent returns to free space only
 ///   when its last pin goes. A put of another key therefore never lands under
 ///   a read in flight.
+/// - **Shared until the last name goes.** Several entries may name one
+///   extent (a chunk's batches); it is freed only once none names it and no
+///   pin holds it.
 #[derive(Debug)]
 pub(super) struct Extents {
     /// The extent each entry's current object lies in, by offset.
@@ -42,8 +45,8 @@ struct Extent {
     len: u64,
     /// Reads and writes in flight over the extent.
     pins: u64,
-    /// Whether an entry names it in `named`.
-    named: bool,
+    /// How many entries name it in `named`.
+    names: u32,
 }
 
 impl Extents {
@@ -95,7 +98,7 @@ impl Extents {
             Extent {
                 len,
                 pins: 1,
-                named: false,
+                names: 0,
             },
         );
         self.used += len;
@@ -103,15 +106,20 @@ impl Extents {
     }
 
     /// Name the extent at `at`, which a pin holds, as `entry`'s object. The
-    /// extent `entry` named before is unnamed, and freed once unpinned.
+    /// extent `entry` named before loses that name, and is freed once no
+    /// entry names it and no pin holds it.
     pub(super) fn name(&mut self, entry: EntryID, at: u64) {
-        let Some(extent) = self.held.get_mut(&at) else {
+        if !self.held.contains_key(&at) {
             return;
-        };
-        extent.named = true;
-        if let Some(old) = self.named.insert(entry, at)
-            && old != at
-        {
+        }
+        let old = self.named.insert(entry, at);
+        if old == Some(at) {
+            return;
+        }
+        if let Some(extent) = self.held.get_mut(&at) {
+            extent.names = extent.names.saturating_add(1);
+        }
+        if let Some(old) = old {
             self.unname(old);
         }
     }
@@ -150,7 +158,7 @@ impl Extents {
             return;
         };
         extent.pins = extent.pins.saturating_sub(1);
-        if extent.pins == 0 && !extent.named {
+        if extent.pins == 0 && extent.names == 0 {
             self.release(at);
         }
     }
@@ -159,8 +167,8 @@ impl Extents {
         let Some(extent) = self.held.get_mut(&at) else {
             return;
         };
-        extent.named = false;
-        if extent.pins == 0 {
+        extent.names = extent.names.saturating_sub(1);
+        if extent.pins == 0 && extent.names == 0 {
             self.release(at);
         }
     }
