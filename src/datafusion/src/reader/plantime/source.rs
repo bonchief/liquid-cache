@@ -43,6 +43,21 @@ pub struct Held;
 /// keeps the `ParquetSource` it was made from and applies every setting and
 /// pushdown to it as well as to itself, so either path reads a part the way
 /// the plan asked. Only a part marked [`Held`] goes through the cache reader.
+///
+/// **Both paths decode a part to the same values.** The cache reader, its
+/// fallback and [`LiquidCacheParquet::fill`](crate::cache::LiquidCacheParquet::fill)
+/// decode a file with the stock opener's default coercions only: the
+/// table's view and binary types ([`apply_file_schema_type_coercions`]).
+/// A scan whose stock reader would decode otherwise reads every part, held
+/// or not, through the stock path: one that sets `coerce_int96` (INT96
+/// timestamps at another unit, so values outside 1677-2262 differ) or
+/// `enable_rle_to_dictionary`, and a part that carries its own
+/// `arrow_schema`. A `ParquetSource` given a schema provider
+/// (`with_schema_provider`) cannot be told apart, as it does not expose one;
+/// such a source must not be wrapped. `skip_arrow_metadata` is a writer
+/// option and changes no read.
+///
+/// [`apply_file_schema_type_coercions`]: datafusion::datasource::physical_plan::parquet::apply_file_schema_type_coercions
 #[derive(Clone)]
 pub struct LiquidParquetSource {
     /// The stock source, configured like this one, for parts not held.
@@ -74,6 +89,13 @@ impl LiquidParquetSource {
 
     fn bloom_filter_on_read(&self) -> bool {
         self.table_parquet_options.global.bloom_filter_on_read
+    }
+
+    /// Whether the stock reader decodes a file as the cache reader does:
+    /// with neither of the read coercions the cache reader does not apply.
+    fn decodes_as_stock(&self) -> bool {
+        let options = &self.inner.table_parquet_options().global;
+        options.coerce_int96.is_none() && !options.enable_rle_to_dictionary
     }
 
     /// Set the span for the LiquidParquetSource
@@ -314,7 +336,11 @@ impl FileSource for LiquidParquetSource {
             prefetch: self.prefetch,
             fill: self.fill,
         });
-        Ok(Box::new(DispatchMorselizer { liquid, plain }))
+        Ok(Box::new(DispatchMorselizer {
+            liquid,
+            plain,
+            held: self.decodes_as_stock(),
+        }))
     }
 
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
@@ -530,10 +556,12 @@ impl FileSource for LiquidParquetSource {
 
 /// Sends each part to the reader that serves it: a part marked [`Held`] to
 /// the cache reader, every other part to the stock Parquet reader, with its
-/// access plan as given.
+/// access plan as given. With `held` false, or for a part with its own Arrow
+/// schema, every part goes to the stock reader (see [`LiquidParquetSource`]).
 struct DispatchMorselizer {
     liquid: Box<LiquidMorselizer>,
     plain: Box<dyn Morselizer>,
+    held: bool,
 }
 
 impl fmt::Debug for DispatchMorselizer {
@@ -544,7 +572,7 @@ impl fmt::Debug for DispatchMorselizer {
 
 impl Morselizer for DispatchMorselizer {
     fn plan_file(&self, file: PartitionedFile) -> Result<Box<dyn MorselPlanner>> {
-        if file.extensions.contains::<Held>() {
+        if self.held && file.arrow_schema.is_none() && file.extensions.contains::<Held>() {
             self.liquid.plan_file(file)
         } else {
             self.plain.plan_file(file)

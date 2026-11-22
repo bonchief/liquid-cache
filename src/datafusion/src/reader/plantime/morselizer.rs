@@ -1476,6 +1476,94 @@ mod tests {
         assert_eq!(held.cache.storage().stats().total_entries, 4);
     }
 
+    /// Read Spark's INT96 file (`test_data/int96_from_spark.parquet`, from
+    /// apache/parquet-testing: six timestamps, one of them null and two past
+    /// what nanoseconds hold) through a source made from a stock
+    /// `ParquetSource` with `coerce_int96` at `unit`, its part marked held
+    /// or not: the values as `i64` in the type the read gave, and the cache.
+    async fn read_int96(
+        unit: Option<&str>,
+        held: bool,
+    ) -> (DataType, Vec<Option<i64>>, Arc<LiquidCacheParquet>) {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let bytes = include_bytes!("../../../test_data/int96_from_spark.parquet");
+        std::fs::write(tmp_dir.path().join("int96.parquet"), bytes).unwrap();
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).unwrap());
+        let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+            .parse_and_finish(&bytes::Bytes::from_static(bytes))
+            .unwrap();
+        let mut schema =
+            parquet::arrow::parquet_to_arrow_schema(metadata.file_metadata().schema_descr(), None)
+                .unwrap();
+        let mut options = datafusion::config::TableParquetOptions::default();
+        if let Some(unit) = unit {
+            options.global.coerce_int96 = Some(unit.parse().unwrap());
+            schema = datafusion::datasource::physical_plan::parquet::Int96Coercer::new(
+                metadata.file_metadata().schema_descr(),
+                &schema,
+                &arrow_schema::TimeUnit::from(options.global.coerce_int96.unwrap()),
+            )
+            .coerce()
+            .unwrap();
+        }
+        let schema = Arc::new(schema);
+        let mut file = PartitionedFile::new("int96.parquet", bytes.len() as u64);
+        if held {
+            file.extensions.insert(crate::reader::Held);
+        }
+        let parquet_source = ParquetSource::new(Arc::clone(&schema))
+            .with_table_parquet_options(options)
+            .with_parquet_file_reader_factory(Arc::new(DefaultParquetFileReaderFactory::new(
+                Arc::clone(&object_store),
+            )));
+        let cache = create_test_cache(tmp_dir.path(), usize::MAX, usize::MAX).await;
+        let source = LiquidParquetSource::from_parquet_source(parquet_source, Arc::clone(&cache));
+        let base_config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(source.clone()),
+        )
+        .with_file(file.clone())
+        .build();
+        let morselizer = source
+            .create_morselizer(object_store, &base_config, 0)
+            .unwrap();
+        let morsels = drive_planner(morselizer.plan_file(file).unwrap()).await;
+        let mut values = Vec::new();
+        for morsel in morsels {
+            for batch in morsel.into_stream().collect::<Vec<_>>().await {
+                let column = arrow::compute::cast(batch.unwrap().column(0), &DataType::Int64);
+                let batch = column.unwrap();
+                use arrow::array::AsArray;
+                values.extend(batch.as_primitive::<arrow::datatypes::Int64Type>().iter());
+            }
+        }
+        let kind = schema.field(0).data_type().clone();
+        (kind, values, cache)
+    }
+
+    #[tokio::test]
+    async fn a_held_part_decodes_int96_as_the_stock_path_does() {
+        for unit in [None, Some("us"), Some("ms")] {
+            let (kind, stock, _) = read_int96(unit, false).await;
+            let (_, held, cache) = read_int96(unit, true).await;
+            assert_eq!(held, stock, "coerce_int96 {unit:?} ({kind})");
+            assert_eq!(stock.len(), 6);
+            assert_eq!(stock.iter().filter(|value| value.is_none()).count(), 1);
+            match unit {
+                // Default decoding: the cache reader read it and filled.
+                None => assert!(cache.storage().stats().total_entries > 0),
+                // Coerced: the held part went through the stock reader.
+                Some(_) => assert_eq!(cache.storage().stats().total_entries, 0),
+            }
+        }
+        // Past what nanoseconds hold, microseconds keep 9999-12-31 apart
+        // from nanoseconds' wrapped value.
+        let (_, nanos, _) = read_int96(None, true).await;
+        let (_, micros, _) = read_int96(Some("us"), true).await;
+        assert_ne!(nanos[2].map(|v| v / 1000), micros[2]);
+    }
+
     #[tokio::test]
     async fn with_fill_off_a_held_part_inserts_nothing() {
         let read = read_through_source(true, false).await;
