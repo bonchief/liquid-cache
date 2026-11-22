@@ -279,8 +279,11 @@ struct RowGroupPlanningContext {
     page_pruning_predicate: Option<Arc<PagePruningAccessPlanFilter>>,
 }
 
+/// Bloom filters loaded for the pruning predicate they were loaded for, so
+/// pruning by them always has one.
 struct BloomFiltersLoadedLiquidOpen {
     prepared: PreparedRowGroups,
+    predicate: Arc<PruningPredicate>,
     bloom_filters: Vec<BloomFilterStatistics>,
 }
 
@@ -358,13 +361,8 @@ impl LiquidOpenState {
             Self::LoadBloomFilters(future) => Ok(Self::LoadBloomFilters(future)),
             Self::PruneBloomAndPages(loaded) => {
                 let mut prepared = loaded.prepared;
-                let predicate = prepared
-                    .context
-                    .pruning_predicate
-                    .as_deref()
-                    .expect("bloom filters are loaded only with a pruning predicate");
                 prepared.row_groups.prune_by_bloom_filters(
-                    predicate,
+                    &loaded.predicate,
                     &prepared.context.prepared.metrics.file_metrics,
                     &loaded.bloom_filters,
                 );
@@ -493,20 +491,13 @@ fn prepare_and_prune_by_stats(mut loaded: MetadataLoadedLiquidOpen) -> Result<Li
         },
         row_groups,
     };
-    let read_bloom_filters = prepared.context.pruning_predicate.is_some()
-        && prepared.context.prepared.enable_bloom_filter
-        && !prepared.row_groups.is_empty();
-    if read_bloom_filters {
+    let bloom_predicate = prepared.context.pruning_predicate.clone().filter(|_| {
+        prepared.context.prepared.enable_bloom_filter && !prepared.row_groups.is_empty()
+    });
+    if let Some(predicate) = bloom_predicate {
         Ok(LiquidOpenState::LoadBloomFilters(
             async move {
                 let mut prepared = prepared;
-                let predicate = Arc::clone(
-                    prepared
-                        .context
-                        .pruning_predicate
-                        .as_ref()
-                        .expect("pruning predicate was checked before scheduling bloom I/O"),
-                );
                 let bloom_filters = load_bloom_filters(
                     &mut prepared.context.builder,
                     predicate.as_ref(),
@@ -516,6 +507,7 @@ fn prepare_and_prune_by_stats(mut loaded: MetadataLoadedLiquidOpen) -> Result<Li
                 .await;
                 Ok(BloomFiltersLoadedLiquidOpen {
                     prepared,
+                    predicate,
                     bloom_filters,
                 })
             }

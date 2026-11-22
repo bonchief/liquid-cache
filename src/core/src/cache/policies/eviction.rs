@@ -82,13 +82,19 @@ fn persist(entry: &CacheEntry) -> EvictionOutcome {
                 EvictionOutcome::Drop
             }
         },
-        CacheEntry::MemoryLiquid(array) => {
-            let bytes = Bytes::from(array.to_bytes());
-            EvictionOutcome::Replace {
-                entry: CacheEntry::disk_liquid(array.original_arrow_data_type(), bytes.len()),
-                bytes_to_write: Some(bytes),
+        CacheEntry::MemoryLiquid(array) => match array.to_bytes() {
+            Ok(bytes) => {
+                let bytes = Bytes::from(bytes);
+                EvictionOutcome::Replace {
+                    entry: CacheEntry::disk_liquid(array.original_arrow_data_type(), bytes.len()),
+                    bytes_to_write: Some(bytes),
+                }
             }
-        }
+            Err(error) => {
+                log::warn!("dropped a cached Liquid array that does not serialise: {error}");
+                EvictionOutcome::Drop
+            }
+        },
         CacheEntry::DiskLiquid { .. } | CacheEntry::DiskArrow { .. } => EvictionOutcome::Remove,
     }
 }

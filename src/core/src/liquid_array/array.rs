@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 
 use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::buffer::{BooleanBuffer, NullBuffer};
-use arrow_schema::{DataType, Field};
+use arrow_schema::{ArrowError, DataType, Field};
 use bytes::Bytes;
 use datafusion_common::ScalarValue;
 use datafusion_expr_common::operator::Operator as DataFusionOperator;
@@ -125,7 +125,7 @@ impl LiquidArray {
     /// A block that does not decode back is an error, never a panic: the
     /// caller keeps the Arrow array.
     fn compacted(self) -> VortexResult<Self> {
-        let (alignment, pieces) = self.encode();
+        let (alignment, pieces) = self.encode()?;
         let len = pieces.iter().map(ByteBuffer::len).sum();
         let mut block = ByteBufferMut::with_capacity_aligned(len, alignment);
         for piece in &pieces {
@@ -230,23 +230,22 @@ impl LiquidArray {
     /// JSON), the row count, and the array segment. The segment starts at a
     /// multiple of the alignment and pads each buffer to its own alignment,
     /// so every buffer decodes in place.
-    fn encode(&self) -> (Alignment, Vec<ByteBuffer>) {
+    ///
+    /// Fails, rather than panics, when Vortex cannot serialize the array or
+    /// a section does not fit its 32-bit length.
+    fn encode(&self) -> VortexResult<(Alignment, Vec<ByteBuffer>)> {
         let dtype_message = MessageEncoder::new(SESSION.clone())
-            .encode(EncoderMessage::DType(self.array.dtype()))
-            .expect("Vortex dtype serialization")
+            .encode(EncoderMessage::DType(self.array.dtype()))?
             .concat();
         let context = ArrayContext::empty();
-        let segment = self
-            .array
-            .serialize(
-                &context,
-                &SESSION,
-                &SerializeOptions {
-                    offset: 0,
-                    include_padding: true,
-                },
-            )
-            .expect("Vortex array serialization");
+        let segment = self.array.serialize(
+            &context,
+            &SESSION,
+            &SerializeOptions {
+                offset: 0,
+                include_padding: true,
+            },
+        )?;
         let encodings: Vec<String> = context
             .to_ids()
             .iter()
@@ -260,38 +259,50 @@ impl LiquidArray {
             .fold(MIN_ALIGNMENT, Ord::max);
 
         let mut head = header_bytes(alignment).to_vec();
+        let json = |error: serde_json::Error| vortex_err!("serializing a Liquid section: {error}");
         for section in [
-            serde_json::to_vec(&self.arrow_type).expect("Arrow data type serializes"),
+            serde_json::to_vec(&self.arrow_type).map_err(json)?,
             dtype_message,
-            serde_json::to_vec(&encodings).expect("encoding ids serialize"),
+            serde_json::to_vec(&encodings).map_err(json)?,
         ] {
-            let len = u32::try_from(section.len()).expect("Liquid array section fits in u32");
+            let len = u32::try_from(section.len())
+                .map_err(|_| vortex_err!("a Liquid array section exceeds 4 GiB"))?;
             head.extend_from_slice(&len.to_le_bytes());
             head.extend_from_slice(&section);
         }
-        let row_count = u32::try_from(self.array.len()).expect("Liquid array length fits in u32");
+        let row_count = u32::try_from(self.array.len())
+            .map_err(|_| vortex_err!("a Liquid array exceeds u32::MAX rows"))?;
         head.extend_from_slice(&row_count.to_le_bytes());
         head.resize(head.len().next_multiple_of(alignment.as_usize()), 0);
 
         let mut pieces = Vec::with_capacity(segment.len() + 1);
         pieces.push(ByteBuffer::from(head));
         pieces.extend(segment);
-        (alignment, pieces)
+        Ok((alignment, pieces))
     }
 
-    fn export(&self, array: vortex_array::ArrayRef) -> ArrayRef {
+    fn export(&self, array: vortex_array::ArrayRef) -> Result<ArrayRef, ArrowError> {
         let field = Field::new("", self.arrow_type.clone(), array.dtype().is_nullable());
         let mut ctx = SESSION.create_execution_ctx();
         SESSION
             .arrow()
             .execute_arrow(array, Some(&field), &mut ctx)
-            .expect("Vortex array must export to its import Arrow type")
+            .map_err(arrow_error)
     }
 
-    fn filtered_vortex(&self, filter: &BooleanBuffer) -> vortex_array::ArrayRef {
-        assert_eq!(filter.len(), self.len(), "filter length must match array");
+    fn filtered_vortex(
+        &self,
+        filter: &BooleanBuffer,
+    ) -> Result<vortex_array::ArrayRef, ArrowError> {
+        if filter.len() != self.len() {
+            return Err(ArrowError::InvalidArgumentError(format!(
+                "a filter of {} rows on a Liquid array of {}",
+                filter.len(),
+                self.len()
+            )));
+        }
         let mask = Mask::from_buffer(BitBuffer::from(filter.clone()));
-        self.array.filter(mask).expect("Vortex filter must succeed")
+        self.array.filter(mask).map_err(arrow_error)
     }
 
     fn try_vortex_predicate(
@@ -443,8 +454,9 @@ impl LiquidArray {
         self.len() == 0
     }
 
-    /// Convert the Liquid array to an Arrow array.
-    pub fn to_arrow_array(&self) -> ArrayRef {
+    /// Convert the Liquid array to an Arrow array. Fails if Vortex cannot
+    /// export it to its Arrow type.
+    pub fn to_arrow_array(&self) -> Result<ArrayRef, ArrowError> {
         self.export(self.array.clone())
     }
 
@@ -453,28 +465,30 @@ impl LiquidArray {
         self.arrow_type.clone()
     }
 
-    /// Serialize the Liquid array.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let (_, pieces) = self.encode();
+    /// Serialize the Liquid array. Fails if Vortex cannot serialize it.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ArrowError> {
+        let (_, pieces) = self.encode().map_err(arrow_error)?;
         let mut bytes = Vec::with_capacity(pieces.iter().map(ByteBuffer::len).sum());
         for piece in &pieces {
             bytes.extend_from_slice(piece);
         }
-        bytes
+        Ok(bytes)
     }
 
-    /// Filter the Liquid array and return an Arrow array.
-    pub fn filter(&self, selection: &BooleanBuffer) -> ArrayRef {
-        self.export(self.filtered_vortex(selection))
+    /// Filter the Liquid array and return an Arrow array. A selection of
+    /// another length than the array is an error.
+    pub fn filter(&self, selection: &BooleanBuffer) -> Result<ArrayRef, ArrowError> {
+        self.export(self.filtered_vortex(selection)?)
     }
 
-    /// Evaluate a predicate on selected rows.
+    /// Evaluate a predicate on selected rows. A selection of another length
+    /// than the array, or a predicate that does not evaluate, is an error.
     pub fn try_eval_predicate(
         &self,
         predicate: &LiquidExpr,
         filter: &BooleanBuffer,
-    ) -> BooleanArray {
-        let filtered = self.filtered_vortex(filter);
+    ) -> Result<BooleanArray, ArrowError> {
+        let filtered = self.filtered_vortex(filter)?;
         if let Some(value) = predicate
             .physical_expr()
             .downcast_ref::<Literal>()
@@ -492,14 +506,22 @@ impl LiquidArray {
             let validity = filtered
                 .validity()
                 .and_then(|validity| validity.execute_mask(filtered.len(), &mut ctx))
-                .expect("Vortex array validity must execute");
-            return BooleanArray::new(values, vortex_arrow::to_null_buffer(validity));
+                .map_err(arrow_error)?;
+            return Ok(BooleanArray::new(
+                values,
+                vortex_arrow::to_null_buffer(validity),
+            ));
         }
-        let Some(result) = self.try_eval_vortex_predicate(&filtered, predicate) else {
-            return eval_predicate_on_array(self.export(filtered), predicate);
-        };
-        result
+        match self.try_eval_vortex_predicate(&filtered, predicate) {
+            Some(result) => Ok(result),
+            None => eval_predicate_on_array(self.export(filtered)?, predicate),
+        }
     }
+}
+
+/// A Vortex failure on a query path, as the Arrow error the reader returns.
+fn arrow_error(error: vortex_error::VortexError) -> ArrowError {
+    ArrowError::ExternalError(Box::new(error))
 }
 
 fn header_bytes(alignment: Alignment) -> [u8; HEADER_SIZE] {
@@ -694,7 +716,7 @@ mod tests {
 
     fn roundtrip(array: ArrayRef) {
         let vortex = LiquidArray::from_arrow_array(&array).unwrap();
-        assert_eq!(vortex.to_arrow_array().as_ref(), array.as_ref());
+        assert_eq!(vortex.to_arrow_array().unwrap().as_ref(), array.as_ref());
     }
 
     #[test]
@@ -768,7 +790,28 @@ mod tests {
         let vortex = LiquidArray::from_arrow_array(&array).unwrap();
         let expected =
             arrow::compute::filter(&array, &BooleanArray::new(selection.clone(), None)).unwrap();
-        assert_eq!(vortex.filter(&selection).as_ref(), expected.as_ref());
+        assert_eq!(
+            vortex.filter(&selection).unwrap().as_ref(),
+            expected.as_ref()
+        );
+    }
+
+    #[test]
+    fn a_selection_of_another_length_is_an_error_not_a_panic() {
+        let array: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4]));
+        let vortex = LiquidArray::from_arrow_array(&array).unwrap();
+        let short = BooleanBuffer::new_set(3);
+        assert!(matches!(
+            vortex.filter(&short),
+            Err(ArrowError::InvalidArgumentError(_))
+        ));
+        let expr = comparison_expr(
+            DataFusionOperator::Gt,
+            ScalarValue::Int64(Some(2)),
+            array.data_type(),
+        );
+        assert!(vortex.try_eval_predicate(&expr, &short).is_err());
+        assert!(vortex.try_eval_predicate(&expr, &BooleanBuffer::new_set(4)).is_ok());
     }
 
     fn comparison_expr(
@@ -801,18 +844,18 @@ mod tests {
     ) -> BooleanArray {
         let filtered =
             arrow::compute::filter(array, &BooleanArray::new(selection.clone(), None)).unwrap();
-        eval_predicate_on_array(filtered, expr)
+        eval_predicate_on_array(filtered, expr).unwrap()
     }
 
     fn assert_predicate_matches(name: &str, array: &ArrayRef, expr: &LiquidExpr) {
         let selection = BooleanBuffer::new_set(array.len());
         let vortex = LiquidArray::from_arrow_array(array).unwrap();
-        let filtered = vortex.filtered_vortex(&selection);
+        let filtered = vortex.filtered_vortex(&selection).unwrap();
         if vortex.try_eval_vortex_predicate(&filtered, expr).is_none() {
             eprintln!("Vortex predicate fell back to Arrow: {name}");
         }
         assert_eq!(
-            vortex.try_eval_predicate(expr, &selection),
+            vortex.try_eval_predicate(expr, &selection).unwrap(),
             expected_predicate(array, expr, &selection),
             "predicate case {name}"
         );
@@ -857,7 +900,7 @@ mod tests {
                         integers.data_type(),
                     );
                     assert_eq!(
-                        vortex.try_eval_predicate(&expr, &selection),
+                        vortex.try_eval_predicate(&expr, &selection).unwrap(),
                         expected_predicate(&integers, &expr, &selection)
                     );
                 }
@@ -872,7 +915,7 @@ mod tests {
                         strings.data_type(),
                     );
                     assert_eq!(
-                        vortex.try_eval_predicate(&expr, &selection),
+                        vortex.try_eval_predicate(&expr, &selection).unwrap(),
                         expected_predicate(&strings, &expr, &selection)
                     );
                 }
@@ -1026,7 +1069,7 @@ mod tests {
             );
             let selection = BooleanBuffer::new_set(array.len());
             assert_eq!(
-                vortex.try_eval_predicate(&expr, &selection),
+                vortex.try_eval_predicate(&expr, &selection).unwrap(),
                 expected_predicate(&array, &expr, &selection)
             );
         }
@@ -1043,7 +1086,9 @@ mod tests {
         let predicate = LiquidExpr::try_new(physical, array.data_type()).unwrap();
         let vortex = LiquidArray::from_arrow_array(&array).unwrap();
         assert_eq!(
-            vortex.try_eval_predicate(&predicate, &BooleanBuffer::new_set(array.len())),
+            vortex
+                .try_eval_predicate(&predicate, &BooleanBuffer::new_set(array.len()))
+                .unwrap(),
             BooleanArray::new(BooleanBuffer::new_set(array.len()), array.nulls().cloned())
         );
     }
@@ -1086,8 +1131,8 @@ mod tests {
         ];
         for array in arrays {
             let vortex = LiquidArray::from_arrow_array(&array).unwrap();
-            let decoded = LiquidArray::from_bytes(Bytes::from(vortex.to_bytes()));
-            assert_eq!(decoded.to_arrow_array().as_ref(), array.as_ref());
+            let decoded = LiquidArray::from_bytes(Bytes::from(vortex.to_bytes().unwrap()));
+            assert_eq!(decoded.to_arrow_array().unwrap().as_ref(), array.as_ref());
         }
     }
 
@@ -1134,7 +1179,7 @@ mod tests {
                 );
             }
             assert_eq!(
-                liquid.to_arrow_array().as_ref(),
+                liquid.to_arrow_array().unwrap().as_ref(),
                 &StringViewArray::from_iter_values(std::iter::repeat_n(value, 8192)) as &dyn Array
             );
         }
@@ -1183,7 +1228,7 @@ mod tests {
             codes.len(),
             codes.capacity()
         );
-        assert_eq!(liquid.to_arrow_array().as_ref(), array.as_ref());
+        assert_eq!(liquid.to_arrow_array().unwrap().as_ref(), array.as_ref());
     }
 
     /// Columns whose encoded buffers land at offsets their alignment rejects
@@ -1255,7 +1300,7 @@ mod tests {
             // An allocation aligned for any buffer, so only the layout
             // inside the block decides whether a buffer is copied.
             let block = vortex_buffer::ByteBufferMut::copy_from_aligned(
-                liquid.to_bytes(),
+                liquid.to_bytes().unwrap(),
                 vortex_buffer::Alignment::new(64),
             )
             .freeze()
@@ -1267,7 +1312,7 @@ mod tests {
                 outside.is_empty(),
                 "{name}: decoding copied buffers out of the block: {outside:?}"
             );
-            assert_eq!(decoded.to_arrow_array().as_ref(), column.as_ref());
+            assert_eq!(decoded.to_arrow_array().unwrap().as_ref(), column.as_ref());
         }
     }
 }

@@ -446,12 +446,15 @@ fn growth_from_predicate(
     let selection = BooleanBuffer::new_set(ROWS);
     let base = live();
     let charged = liquid.get_array_memory_size() as isize;
-    let matches = liquid.try_eval_predicate(&expr, &selection);
+    let matches = liquid.try_eval_predicate(&expr, &selection).unwrap();
     assert!(
         matches.true_count() > 0,
         "the literal is a value of the column"
     );
-    assert_eq!(matches, eval_predicate_on_array(source.clone(), &expr));
+    assert_eq!(
+        matches,
+        eval_predicate_on_array(source.clone(), &expr).unwrap()
+    );
     drop(matches);
     let grown = live() - base;
     let charge_grown = liquid.get_array_memory_size() as isize - charged;

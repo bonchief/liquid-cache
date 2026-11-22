@@ -1,8 +1,7 @@
-use arrow::array::cast::AsArray;
 use arrow::array::{ArrayRef, BooleanArray};
 use arrow::buffer::BooleanBuffer;
-use arrow::record_batch::RecordBatch;
-use arrow_schema::{ArrowError, Field, Schema};
+
+use arrow_schema::ArrowError;
 use bytes::Bytes;
 use futures::StreamExt;
 
@@ -767,16 +766,25 @@ impl LiquidCache {
                         continue;
                     }
                 },
-                CacheEntry::MemoryLiquid(liquid_array) => {
-                    let bytes = Bytes::from(liquid_array.to_bytes());
-                    (
-                        CacheEntry::disk_liquid(
-                            liquid_array.original_arrow_data_type(),
-                            bytes.len(),
-                        ),
-                        bytes,
-                    )
-                }
+                CacheEntry::MemoryLiquid(liquid_array) => match liquid_array.to_bytes() {
+                    Ok(bytes) => {
+                        let bytes = Bytes::from(bytes);
+                        (
+                            CacheEntry::disk_liquid(
+                                liquid_array.original_arrow_data_type(),
+                                bytes.len(),
+                            ),
+                            bytes,
+                        )
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "dropped a cached Liquid array that does not serialise: {error}"
+                        );
+                        self.drop_memory_entry(entry_id);
+                        continue;
+                    }
+                },
                 // Already on disk.
                 CacheEntry::DiskArrow { .. } | CacheEntry::DiskLiquid { .. } => continue,
             };
@@ -836,7 +844,13 @@ impl LiquidCache {
                 if self.config.max_disk_bytes() == 0 {
                     return Err(CacheFull);
                 }
-                let liquid_bytes = Bytes::from(liquid_array.to_bytes());
+                let liquid_bytes = match liquid_array.to_bytes() {
+                    Ok(bytes) => Bytes::from(bytes),
+                    Err(error) => {
+                        log::warn!("a cached Liquid array does not serialise: {error}");
+                        return Err(CacheFull);
+                    }
+                };
                 let disk_bytes = liquid_bytes.len();
                 let write = self
                     .write_batch_to_disk(entry_id, identity, &batch, liquid_bytes)
@@ -1080,7 +1094,15 @@ impl LiquidCache {
             self.budget.charge_memory(unreserved);
         }
         let cached_batch_type = CachedBatchType::from(&to_insert);
-        let displaced = self.index.insert(&entry_id, identity, to_insert);
+        let displaced = match self.index.insert(&entry_id, identity, to_insert) {
+            Ok(displaced) => displaced,
+            // The index could not allocate: refused as a full budget, with
+            // the charge given back.
+            Err(refused) => {
+                self.budget.release_memory(new_memory_size);
+                return Err(refused);
+            }
+        };
         // A displaced entry a snapshot still holds stays charged.
         let released = displaced.as_ref().map_or(0, |slot| {
             slot.entry.memory_usage_bytes()
@@ -1673,10 +1695,13 @@ impl LiquidCache {
                 }
                 None => Some(array.clone()),
             },
+            // A batch that does not export is a miss, logged, never a panic.
             CacheEntry::MemoryLiquid(array) => match selection {
-                Some(selection) => Some(array.filter(selection)),
-                None => Some(array.to_arrow_array()),
-            },
+                Some(selection) => array.filter(selection),
+                None => array.to_arrow_array(),
+            }
+            .inspect_err(|error| log::warn!("a Liquid batch did not export: {error}"))
+            .ok(),
             CacheEntry::DiskArrow { .. } | CacheEntry::DiskLiquid { .. } => {
                 self.read_disk_array(entry, entry_id, identity, expression, selection)
                     .await
@@ -1732,9 +1757,11 @@ impl LiquidCache {
                 )
                 .await;
                 match selection {
-                    Some(selection) => Some(liquid.filter(selection)),
-                    None => Some(liquid.to_arrow_array()),
+                    Some(selection) => liquid.filter(selection),
+                    None => liquid.to_arrow_array(),
                 }
+                .inspect_err(|error| log::warn!("a Liquid batch did not export: {error}"))
+                .ok()
             }
             // Called with disk records only.
             CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => None,
@@ -2227,7 +2254,7 @@ impl LiquidCache {
         identity: u64,
         selection_opt: Option<&BooleanBuffer>,
         predicate: &LiquidExpr,
-    ) -> Option<BooleanArray> {
+    ) -> Option<Result<BooleanArray, ArrowError>> {
         self.observer.on_eval_predicate();
         let slot = self.index.get_for(entry_id, identity)?;
         self.cache_policy
@@ -2253,7 +2280,7 @@ impl LiquidCache {
         entry: &CacheEntry,
         selection_opt: Option<&BooleanBuffer>,
         predicate: &LiquidExpr,
-    ) -> Option<BooleanArray> {
+    ) -> Option<Result<BooleanArray, ArrowError>> {
         self.observer.on_eval_predicate();
         self.eval_predicate_on_entry_inner(entry_id, identity, entry, selection_opt, predicate)
             .await
@@ -2266,7 +2293,7 @@ impl LiquidCache {
         entry: &CacheEntry,
         selection_opt: Option<&BooleanBuffer>,
         predicate: &LiquidExpr,
-    ) -> Option<BooleanArray> {
+    ) -> Option<Result<BooleanArray, ArrowError>> {
         self.trace(InternalEvent::EvalPredicate {
             entry: *entry_id,
             selection: selection_opt.is_some(),
@@ -2283,11 +2310,13 @@ impl LiquidCache {
                     Some(selection) => {
                         let selection_array = BooleanArray::new(selection.clone(), None);
                         arrow::compute::filter(array, &selection_array)
-                            .expect("selection must match array length")
                     }
-                    None => Arc::clone(array),
+                    None => Ok(Arc::clone(array)),
                 };
-                Some(self.eval_predicate_on_array(filtered, predicate))
+                Some(
+                    filtered
+                        .and_then(|filtered| Self::eval_predicate_on_array(filtered, predicate)),
+                )
             }
             entry @ CacheEntry::DiskArrow { .. } => {
                 let array = self.read_disk_arrow_array(entry_id, identity).await?;
@@ -2299,24 +2328,22 @@ impl LiquidCache {
                     None,
                 )
                 .await;
-                let mut owned = None;
-                let selection = selection_opt.unwrap_or_else(|| {
-                    owned = Some(BooleanBuffer::new_set(array.len()));
-                    owned.as_ref().unwrap()
-                });
-                let selection_array = BooleanArray::new(selection.clone(), None);
-                let filtered = arrow::compute::filter(&array, &selection_array)
-                    .expect("selection must match array length");
-                Some(self.eval_predicate_on_array(filtered, predicate))
+                let filtered = match selection_opt {
+                    Some(selection) => {
+                        let selection_array = BooleanArray::new(selection.clone(), None);
+                        arrow::compute::filter(&array, &selection_array)
+                    }
+                    None => Ok(array),
+                };
+                Some(
+                    filtered
+                        .and_then(|filtered| Self::eval_predicate_on_array(filtered, predicate)),
+                )
             }
-            CacheEntry::MemoryLiquid(array) => {
-                let mut owned = None;
-                let selection = selection_opt.unwrap_or_else(|| {
-                    owned = Some(BooleanBuffer::new_set(array.len()));
-                    owned.as_ref().unwrap()
-                });
-                Some(array.try_eval_predicate(predicate, selection))
-            }
+            CacheEntry::MemoryLiquid(array) => Some(match selection_opt {
+                Some(selection) => array.try_eval_predicate(predicate, selection),
+                None => array.try_eval_predicate(predicate, &BooleanBuffer::new_set(array.len())),
+            }),
             entry @ CacheEntry::DiskLiquid { .. } => {
                 let liquid = self.read_disk_liquid_array(entry_id, identity).await?;
                 self.maybe_hydrate(
@@ -2327,32 +2354,23 @@ impl LiquidCache {
                     None,
                 )
                 .await;
-                let mut owned = None;
-                let selection = selection_opt.unwrap_or_else(|| {
-                    owned = Some(BooleanBuffer::new_set(liquid.len()));
-                    owned.as_ref().unwrap()
-                });
-                Some(liquid.try_eval_predicate(predicate, selection))
+                Some(match selection_opt {
+                    Some(selection) => liquid.try_eval_predicate(predicate, selection),
+                    None => {
+                        liquid.try_eval_predicate(predicate, &BooleanBuffer::new_set(liquid.len()))
+                    }
+                })
             }
         }
     }
 
-    fn eval_predicate_on_array(&self, array: ArrayRef, predicate: &LiquidExpr) -> BooleanArray {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "liquid_predicate_col",
-            array.data_type().clone(),
-            true,
-        )]));
-        let record_batch =
-            RecordBatch::try_new(schema, vec![array]).expect("single-column predicate batch");
-        let result = predicate
-            .physical_expr()
-            .evaluate(&record_batch)
-            .expect("validated LiquidExpr must evaluate");
-        let boolean_array = result
-            .into_array(record_batch.num_rows())
-            .expect("predicate output must be an array");
-        boolean_array.as_boolean().clone()
+    /// `predicate` on `array`: an error, never a panic, when the batch does
+    /// not build or the predicate does not evaluate to booleans.
+    fn eval_predicate_on_array(
+        array: ArrayRef,
+        predicate: &LiquidExpr,
+    ) -> Result<BooleanArray, ArrowError> {
+        crate::liquid_array::eval_predicate_on_array(array, predicate)
     }
 }
 
@@ -2627,7 +2645,7 @@ mod tests {
 
         // A record naming identity 2 over bytes identity 1 wrote: what a
         // rewrite landing after the key changed hands leaves behind.
-        store.index().insert(&entry_id, 2, disk_entry);
+        store.index().insert(&entry_id, 2, disk_entry).unwrap();
         assert!(store.get(&entry_id, 2).await.is_none());
     }
 

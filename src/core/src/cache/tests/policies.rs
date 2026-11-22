@@ -141,6 +141,7 @@ async fn liquid_eviction_reads_memory_and_disk() {
         .eval_predicate(&id, 0, &predicate)
         .read()
         .await
+        .unwrap()
         .unwrap();
     let expected = arrow::array::BooleanArray::from_iter(
         integers
@@ -151,6 +152,17 @@ async fn liquid_eviction_reads_memory_and_disk() {
             .map(|value| value.map(|value| value >= 1_000)),
     );
     assert_eq!(actual, expected);
+    // A selection that does not match the batch fails the evaluation with
+    // an error, for each form a batch is held in; it never panics.
+    let wrong = BooleanBuffer::new_set(integers.len() + 1);
+    for id in [EntryID::from(0), EntryID::from(1)] {
+        let evaluated = cache
+            .eval_predicate(&id, 0, &predicate)
+            .with_selection(&wrong)
+            .read()
+            .await;
+        assert!(matches!(evaluated, Some(Err(_))), "{evaluated:?}");
+    }
 
     cache.flush_all_to_disk().await.unwrap();
     let mut disk_states = Vec::new();

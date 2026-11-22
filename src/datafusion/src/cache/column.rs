@@ -194,6 +194,12 @@ impl CachedColumn {
                 }
             }
         {
+            // A predicate that does not evaluate on the cached batch fails
+            // the query with its error; it never aborts the process.
+            let boolean_array = match boolean_array {
+                Ok(boolean_array) => boolean_array,
+                Err(error) => return Some(Err(error)),
+            };
             let predicate_filter = match boolean_array.null_count() {
                 0 => boolean_array,
                 _ => prep_null_mask_filter(&boolean_array),

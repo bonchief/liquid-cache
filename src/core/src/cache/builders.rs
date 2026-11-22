@@ -1,6 +1,8 @@
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 
+use arrow_schema::ArrowError;
+
 use arrow::array::{
     Array, ArrayData, ArrayRef, BinaryViewArray, BooleanArray, StringViewArray, make_array,
 };
@@ -468,8 +470,10 @@ impl<'a> EvaluatePredicate<'a> {
         self
     }
 
-    /// Evaluate the predicate against the cached data.
-    pub async fn read(self) -> Option<BooleanArray> {
+    /// Evaluate the predicate against the cached data: `None` when nothing
+    /// is cached for the entry, an error when the predicate does not
+    /// evaluate on what is.
+    pub async fn read(self) -> Option<Result<BooleanArray, ArrowError>> {
         self.storage
             .eval_predicate_internal(self.entry_id, self.identity, self.selection, self.predicate)
             .await
@@ -477,8 +481,10 @@ impl<'a> EvaluatePredicate<'a> {
 }
 
 impl<'a> IntoFuture for EvaluatePredicate<'a> {
-    type Output = Option<BooleanArray>;
-    type IntoFuture = Pin<Box<dyn std::future::Future<Output = Option<BooleanArray>> + Send + 'a>>;
+    type Output = Option<Result<BooleanArray, ArrowError>>;
+    type IntoFuture = Pin<
+        Box<dyn std::future::Future<Output = Option<Result<BooleanArray, ArrowError>>> + Send + 'a>,
+    >;
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move { self.read().await })

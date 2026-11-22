@@ -203,22 +203,32 @@ impl ArtIndex {
     /// Returns the slot this insert replaced. The tree hands a replaced slot
     /// to exactly one insert or removal, so whatever the slot held is the
     /// caller's alone to give back.
+    ///
+    /// The tree refuses an insert only when it cannot allocate a node; the
+    /// batch is then handed back, nothing changed, rather than the process
+    /// aborting.
     pub(crate) fn insert(
         &self,
         entry_id: &EntryID,
         identity: u64,
         batch: CacheEntry,
-    ) -> Option<Arc<Slot>> {
+    ) -> Result<Option<Arc<Slot>>, CacheEntry> {
         let guard = self.art.pin();
         self.holdings.add(&batch);
+        // A handle on the batch to give back if the tree refuses it; its
+        // arrays are shared, not copied.
+        let kept = batch.clone();
         let slot = Slot {
             identity,
             entry: batch,
         };
-        let existing = self
+        let Ok(existing) = self
             .art
             .insert(*entry_id, Arc::new(Cell::new(slot)), &guard)
-            .expect("Insertion failed");
+        else {
+            self.holdings.remove(&kept);
+            return Err(kept);
+        };
         let replaced = match existing {
             Some(replaced) => replaced.take(),
             None => {
@@ -229,7 +239,7 @@ impl ArtIndex {
         if let Some(replaced) = &replaced {
             self.holdings.remove(&replaced.entry);
         }
-        replaced
+        Ok(replaced)
     }
 
     pub(crate) fn remove(&self, entry_id: &EntryID) -> Option<Arc<Slot>> {
@@ -328,7 +338,7 @@ mod tests {
 
         // Insert an entry and verify it's cached
         {
-            store.insert(&entry_id1, 0, array1.clone());
+            store.insert(&entry_id1, 0, array1.clone()).unwrap();
         }
 
         assert!(store.contains(&entry_id1, 0));
@@ -350,7 +360,7 @@ mod tests {
         let entry_id: EntryID = EntryID::from(1);
         let array = create_test_array(100);
 
-        store.insert(&entry_id, 0, array.clone());
+        store.insert(&entry_id, 0, array.clone()).unwrap();
 
         let entry_id: EntryID = EntryID::from(1);
         assert!(store.contains(&entry_id, 0));
@@ -372,8 +382,8 @@ mod tests {
             unreachable!()
         };
         let weak_first = Arc::downgrade(first_array);
-        store.insert(&id, 0, first);
-        store.insert(&id, 0, create_test_array(200));
+        store.insert(&id, 0, first).unwrap();
+        store.insert(&id, 0, create_test_array(200)).unwrap();
         assert!(
             weak_first.upgrade().is_none(),
             "replaced entry still alive: held by the index's deferred drop"
@@ -397,14 +407,14 @@ mod tests {
     fn a_slot_is_visible_only_to_its_identity() {
         let store = ArtIndex::new();
         let entry_id = EntryID::from(1);
-        store.insert(&entry_id, 7, create_test_array(10));
+        store.insert(&entry_id, 7, create_test_array(10)).unwrap();
 
         assert!(store.contains(&entry_id, 7));
         assert!(!store.contains(&entry_id, 8));
         assert!(store.get_for(&entry_id, 8).is_none());
         assert_eq!(store.identity_mismatches(), 2);
 
-        store.insert(&entry_id, 8, create_test_array(20));
+        store.insert(&entry_id, 8, create_test_array(20)).unwrap();
         assert!(!store.contains(&entry_id, 7));
         assert!(store.contains(&entry_id, 8));
         assert_eq!(store.entry_count(), 1);
@@ -414,7 +424,7 @@ mod tests {
     fn remove_if_removes_only_a_matching_slot() {
         let store = ArtIndex::new();
         let entry_id = EntryID::from(1);
-        store.insert(&entry_id, 7, create_test_array(10));
+        store.insert(&entry_id, 7, create_test_array(10)).unwrap();
 
         assert!(
             store

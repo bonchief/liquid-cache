@@ -3,7 +3,7 @@ use super::core::same_memory_entry;
 use super::observer::Observer;
 use super::utils::EntryID;
 use crate::sync::{
-    Arc, Mutex, Weak,
+    Arc, Mutex, PoisonError, Weak,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use ahash::AHashMap;
@@ -48,8 +48,16 @@ impl BudgetAccounting {
     }
 
     pub(super) fn reset_usage(&self) {
-        self.held.snapshots.lock().unwrap().clear();
-        self.held.held.lock().unwrap().clear();
+        self.held
+            .snapshots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        self.held
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         self.held.held_len.store(0, Ordering::Relaxed);
         self.used_memory_bytes.store(0, Ordering::Relaxed);
         self.used_disk_bytes.store(0, Ordering::Relaxed);
@@ -63,7 +71,11 @@ impl BudgetAccounting {
 
     /// Record a snapshot of `entry_id` handed to a reader.
     pub(super) fn register_snapshot(&self, entry_id: EntryID, snapshot: &Arc<CacheEntry>) {
-        let mut snapshots = self.held.snapshots.lock().unwrap();
+        let mut snapshots = self
+            .held
+            .snapshots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let live = snapshots.entry(entry_id).or_default();
         live.retain(|weak| weak.strong_count() > 0);
         live.push(Arc::downgrade(snapshot));
@@ -81,7 +93,11 @@ impl BudgetAccounting {
         ) {
             return 0;
         }
-        let mut snapshots = self.held.snapshots.lock().unwrap();
+        let mut snapshots = self
+            .held
+            .snapshots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let Some(live) = snapshots.get_mut(entry_id) else {
             return 0;
         };
@@ -102,7 +118,11 @@ impl BudgetAccounting {
             return 0;
         }
         let bytes = removed.memory_usage_bytes();
-        let mut held = self.held.held.lock().unwrap();
+        let mut held = self
+            .held
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         held.push((holding, bytes));
         self.held.held_len.store(held.len(), Ordering::Relaxed);
         bytes
@@ -114,7 +134,11 @@ impl BudgetAccounting {
             return;
         }
         let mut freed = 0;
-        let mut held = self.held.held.lock().unwrap();
+        let mut held = self
+            .held
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         held.retain(|(snapshots, bytes)| {
             let alive = snapshots.iter().any(|weak| weak.strong_count() > 0);
             if !alive {
@@ -135,7 +159,7 @@ impl BudgetAccounting {
         self.held
             .held
             .lock()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .map(|(_, bytes)| bytes)
             .sum()

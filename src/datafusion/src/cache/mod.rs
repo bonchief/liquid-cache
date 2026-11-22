@@ -3,7 +3,7 @@
 
 use crate::io::ParquetCacheMetadata;
 use crate::reader::{LiquidPredicate, extract_multi_column_or};
-use crate::sync::{Mutex, RwLock};
+use crate::sync::{Mutex, PoisonError, RwLock};
 use ahash::AHashMap;
 use arrow::array::{BooleanArray, RecordBatch, RecordBatchOptions};
 use arrow::buffer::BooleanBuffer;
@@ -106,7 +106,7 @@ impl RowGroupSnapshots {
     pub(crate) fn get(&self, entry_id: &EntryID) -> Option<Arc<CacheEntry>> {
         self.entries
             .read()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .get(entry_id)
             .map(|snapshot| Arc::clone(&snapshot.entry))
     }
@@ -126,15 +126,25 @@ impl RowGroupSnapshots {
             entry,
             _charge: charge,
         };
-        self.entries.write().unwrap().insert(entry_id, snapshot);
+        self.entries
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(entry_id, snapshot);
     }
 
     pub(crate) fn selection(&self, batch_id: BatchID) -> Option<BooleanBuffer> {
-        self.selections.read().unwrap().get(&batch_id).cloned()
+        self.selections
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&batch_id)
+            .cloned()
     }
 
     pub(crate) fn insert_selection(&self, batch_id: BatchID, selection: BooleanBuffer) {
-        self.selections.write().unwrap().insert(batch_id, selection);
+        self.selections
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(batch_id, selection);
     }
 
     /// Drop every snapshot entry and the selection held for `batch_id`.
@@ -142,9 +152,12 @@ impl RowGroupSnapshots {
         let batch = u64::from(*batch_id);
         self.entries
             .write()
-            .unwrap()
+            .unwrap_or_else(PoisonError::into_inner)
             .retain(|entry_id, _| ParquetArrayID::from(*entry_id).batch_id_inner() != batch);
-        self.selections.write().unwrap().remove(&batch_id);
+        self.selections
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&batch_id);
     }
 }
 
@@ -399,12 +412,20 @@ impl CachedRowGroup {
                         }
                         Some(array) => array,
                     };
-                    let buffer = liquid_array.try_eval_predicate(&liquid_expr, selection);
+                    // A predicate that does not evaluate fails the query
+                    // with its error; it never aborts the process.
+                    let buffer = match liquid_array.try_eval_predicate(&liquid_expr, selection) {
+                        Ok(buffer) => buffer,
+                        Err(error) => return Some(Err(error)),
+                    };
 
                     combined_buffer = Some(match combined_buffer {
                         None => buffer,
                         Some(existing) => {
-                            arrow::compute::kernels::boolean::or_kleene(&existing, &buffer).ok()?
+                            match arrow::compute::kernels::boolean::or_kleene(&existing, &buffer) {
+                                Ok(combined) => combined,
+                                Err(error) => return Some(Err(error)),
+                            }
                         }
                     });
                 }

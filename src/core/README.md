@@ -98,7 +98,8 @@ let mask = storage
     .eval_predicate(&entry_id, 0, &liquid_expr)
     .with_selection(&selection)
     .await
-    .unwrap();
+    .unwrap() // the entry is cached
+    .unwrap(); // and the predicate evaluates
 let expected_mask = BooleanArray::from(vec![Some(true), Some(false), Some(true), Some(false)]);
 assert_eq!(mask, expected_mask);
 });
