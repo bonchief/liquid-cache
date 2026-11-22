@@ -119,8 +119,9 @@ impl Morselizer for LiquidMorselizer {
         let file_name = partitioned_file.object_meta.location.to_string();
         let metrics = LiquidFileMetrics::new(self.partition_index, &file_name, &self.metrics);
         let metadata_size_hint = partitioned_file.metadata_size_hint;
-        let file_identity =
-            ParquetFileIdentity::of(self.object_store_url.clone(), &partitioned_file.object_meta);
+        let file_identity = self
+            .liquid_cache
+            .identity(&self.object_store_url, &partitioned_file.object_meta);
         let reader_factory = Arc::new(LiquidFileReaderFactory {
             factory: Arc::clone(&self.parquet_file_reader_factory),
             partition_index: self.partition_index,
@@ -1660,6 +1661,71 @@ mod tests {
 
         assert_eq!(rows_a, (vec![1, 2], vec![1001, 1002]));
         assert_eq!(rows_b, (vec![10, 20], vec![1010, 1020]));
+    }
+
+    /// Under a namespace, a file filled by a scan through one store is held
+    /// for a scan of it through another; without one, it is not.
+    #[tokio::test]
+    async fn namespace_shares_a_file_across_stores() {
+        let schema = schema();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.parquet");
+        write_single_row_group_file(&path, Arc::clone(&schema), vec![1, 2]);
+        let size = std::fs::metadata(&path).unwrap().len();
+        for namespaced in [true, false] {
+            let cache_dir = tempfile::tempdir().unwrap();
+            let store = liquid_cache::cache::DiskStore::mount(
+                cache_dir.path().join("liquid_cache.disk"),
+                liquid_cache::cache::DiskOptions::default(),
+            )
+            .unwrap();
+            let cache = LiquidCacheParquet::new(
+                4,
+                usize::MAX,
+                usize::MAX,
+                store,
+                Box::new(LiquidPolicy::new()),
+                Box::new(Evict),
+                Box::new(AlwaysHydrate::new()),
+            )
+            .await;
+            let cache = Arc::new(if namespaced {
+                cache.with_namespace(ObjectStoreUrl::parse("files:///").unwrap())
+            } else {
+                cache
+            });
+            let filler = LiquidMorselizer {
+                partition_index: 0,
+                projection: ProjectionExprs::from_indices(&[0, 1], schema.as_ref()),
+                batch_size: 4,
+                predicate: None,
+                table_schema: TableSchema::from(Arc::clone(&schema)),
+                metrics: ExecutionPlanMetricsSet::new(),
+                parquet_file_reader_factory: Arc::new(DefaultParquetFileReaderFactory::new(
+                    Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap()),
+                )),
+                object_store_url: ObjectStoreUrl::parse("scan-a:///").unwrap(),
+                reorder_filters: false,
+                enable_bloom_filter: true,
+                liquid_cache: Arc::clone(&cache),
+                expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
+                span: None,
+                lineages: Arc::default(),
+                prefetch: true,
+                fill: true,
+            };
+            let file = PartitionedFile::new("data.parquet", size);
+            let rows =
+                collect_columns(drive_planner(filler.plan_file(file.clone()).unwrap()).await).await;
+            assert_eq!(rows, (vec![1, 2], vec![1001, 1002]));
+            let other = ObjectStoreUrl::parse("scan-b:///").unwrap();
+            let held = cache.holds_all(
+                &cache.identity(&other, &file.object_meta),
+                &[(0, 2)],
+                &[0, 1],
+            );
+            assert_eq!(held, [namespaced], "namespaced {namespaced}");
+        }
     }
 
     async fn collect_columns(morsels: Vec<Box<dyn Morsel>>) -> (Vec<i32>, Vec<i32>) {

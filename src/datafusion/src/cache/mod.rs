@@ -43,14 +43,18 @@ use registry::{FileKey, FileLease, FileRegistry};
 /// [`LiquidParquetSource`](crate::LiquidParquetSource) that opens the file.
 pub type ColumnLineages = HashMap<String, Arc<CacheExpression>>;
 
-/// The identity of a Parquet object within an object store.
+/// The identity of a Parquet object within a namespace.
 ///
-/// Object paths are only unique within their object store, so both components
-/// are required to keep cached data from different stores isolated. A path
-/// can also be rewritten in place, so the object's size and version tag (its
-/// ETag, or whatever content digest the caller puts there) are part of it too:
-/// another object at the same path is another file, never served this one's
-/// entries.
+/// The namespace is, by default, the object store a scan reads the object
+/// through: object paths are only unique within their store, so both
+/// components keep cached data from different stores isolated. An embedder
+/// whose paths are unique across all its stores names one namespace for the
+/// cache instead ([`LiquidCacheParquet::with_namespace`]), so scans that read
+/// the same object through stores of their own share its entries. A path can
+/// also be rewritten in place, so the object's size and version tag (its
+/// ETag, or whatever content digest the caller puts there) are part of it
+/// too: another object at the same path is another file, never served this
+/// one's entries.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ParquetFileIdentity {
     object_store_url: ObjectStoreUrl,
@@ -583,6 +587,10 @@ pub struct LiquidCacheParquet {
     sweeping: AtomicBool,
 
     fills: FillCounts,
+
+    /// The namespace every file is identified under, whatever store a scan
+    /// reads it through; `None` identifies a file under that store.
+    namespace: Option<ObjectStoreUrl>,
 }
 
 /// How fills and reads that might have filled ended, counted as they end.
@@ -670,7 +678,34 @@ impl LiquidCacheParquet {
             metadata,
             sweeping: AtomicBool::new(false),
             fills: FillCounts::default(),
+            namespace: None,
         }
+    }
+
+    /// This cache, identifying every file under `namespace` rather than
+    /// under the store a scan reads it through.
+    ///
+    /// **Only for an embedder whose object paths, sizes and versions name
+    /// one object across every store it reads through**, for example paths
+    /// that carry their tenant and a content digest as the version. Then a
+    /// file filled by one scan is found by any later scan of it, whatever
+    /// store that scan registered; bytes are still read through each scan's
+    /// own store.
+    pub fn with_namespace(mut self, namespace: ObjectStoreUrl) -> Self {
+        self.namespace = Some(namespace);
+        self
+    }
+
+    /// The identity this cache holds `meta`'s object under, for a scan that
+    /// reads it through `store`: under the cache's namespace when it has
+    /// one ([`Self::with_namespace`]), else under `store`. The cache's reader
+    /// derives every identity here.
+    pub fn identity(
+        &self,
+        store: &ObjectStoreUrl,
+        meta: &object_store::ObjectMeta,
+    ) -> ParquetFileIdentity {
+        ParquetFileIdentity::of(self.namespace.as_ref().unwrap_or(store).clone(), meta)
     }
 
     /// The file registry. One process serves every query, so a panic on
