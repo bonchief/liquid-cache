@@ -227,7 +227,7 @@ impl LiquidFileMetrics {
             prefetch_skipped: MetricBuilder::new(metrics)
                 .counter("prefetch_skipped", partition_index),
             tier_raced_batches: MetricBuilder::new(metrics)
-                .counter("tier_raced_batches", partition_index),
+                .counter(super::LiquidParquetSource::RACED_METRIC, partition_index),
         }
     }
 }
@@ -1422,6 +1422,8 @@ mod tests {
         a: Vec<i32>,
         b: Vec<i32>,
         cache: Arc<LiquidCacheParquet>,
+        /// What the source counted raced for this scan.
+        raced: usize,
     }
 
     /// Read the two-row-group file through a source made from a stock
@@ -1459,7 +1461,12 @@ mod tests {
             .unwrap();
         let morsels = drive_planner(morselizer.plan_file(file).unwrap()).await;
         let (a, b) = collect_columns(morsels).await;
-        SourceRead { a, b, cache }
+        SourceRead {
+            a,
+            b,
+            cache,
+            raced: source.raced_batches(),
+        }
     }
 
     #[tokio::test]
@@ -1470,6 +1477,7 @@ mod tests {
         // The cache reader, filling, would have inserted every batch read.
         assert_eq!(plain.cache.storage().stats().total_entries, 0);
         assert_eq!(plain.cache.counters().raced, 0);
+        assert_eq!(plain.raced, 0);
 
         let held = read_through_source(true, true).await;
         assert_eq!((held.a, held.b), (plain.a, plain.b));
@@ -1575,6 +1583,8 @@ mod tests {
             read.cache.counters().raced > 0,
             "the misses were not counted"
         );
+        // The scan's own count is the cache's, as this scan alone read it.
+        assert_eq!(read.raced as u64, read.cache.counters().raced);
         assert_eq!(read.cache.counters().fills_done, 0);
     }
 

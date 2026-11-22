@@ -143,6 +143,25 @@ impl LiquidParquetSource {
         self
     }
 
+    /// The name of the counter, among this source's metrics
+    /// ([`FileSource::metrics`]), of batches a held read with fill off found
+    /// missing and read from Parquet without inserting; one per partition.
+    pub const RACED_METRIC: &'static str = "tier_raced_batches";
+
+    /// Batches this scan's held reads found missing and read from Parquet
+    /// without inserting, summed over its partitions: the
+    /// [`Self::RACED_METRIC`] counters of this source's metrics set. Every
+    /// source derived from this one by a `with_*` or pushdown shares the
+    /// set, so this counts the scan however its plan was rewritten. The
+    /// cache's own count ([`crate::cache::ParquetTierCounters::raced`]) sums
+    /// every scan.
+    pub fn raced_batches(&self) -> usize {
+        self.metrics
+            .clone_inner()
+            .sum_by_name(Self::RACED_METRIC)
+            .map_or(0, |value| value.as_usize())
+    }
+
     /// Set predicate information.
     pub fn with_predicate(mut self, predicate: Arc<dyn PhysicalExpr>) -> Self {
         self.inner = self.inner.with_predicate(Arc::clone(&predicate));
