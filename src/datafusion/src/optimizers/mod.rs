@@ -992,7 +992,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_plan_rewrite() {
-        let ctx = SessionContext::new();
+        // Filters push down only where the stock source's own setting lets
+        // them, so the session turns it on.
+        let mut config = datafusion::prelude::SessionConfig::new();
+        config.options_mut().execution.parquet.pushdown_filters = true;
+        let ctx = SessionContext::new_with_config(config);
         ctx.register_parquet(
             "nano_hits",
             "../../examples/nano_hits.parquet",

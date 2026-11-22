@@ -401,7 +401,9 @@ impl FileSource for LiquidParquetSource {
     }
 
     /// A filter is reported pushed down only when both paths apply it to
-    /// every row: this reader, and the stock source with its row filter on.
+    /// every row: this reader, and the stock source under its own
+    /// `pushdown_filters` setting. With that off, the stock source applies
+    /// none, so none is reported pushed and the parent keeps every filter.
     /// Either path may still apply one reported not pushed, which the parent
     /// then applies again.
     fn try_pushdown_filters(
@@ -409,11 +411,7 @@ impl FileSource for LiquidParquetSource {
         filters: Vec<Arc<dyn PhysicalExpr>>,
         config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn FileSource>>> {
-        let stock = self
-            .inner
-            .clone()
-            .with_pushdown_filters(true)
-            .try_pushdown_filters(filters.clone(), config)?;
+        let stock = self.inner.try_pushdown_filters(filters.clone(), config)?;
         let inner = match &stock.updated_node {
             Some(node) => self.stock(node),
             None => self.inner.clone(),
@@ -638,6 +636,48 @@ mod tests {
             file("old", Some(10)),
             file("new", Some(90)),
         ]
+    }
+
+    async fn pushed(pushdown: bool) -> Vec<PushedDown> {
+        let dir = tempfile::tempdir().unwrap();
+        let store = liquid_cache::cache::DiskStore::mount(
+            dir.path().join("tier.disk"),
+            liquid_cache::cache::DiskOptions::new(1 << 20),
+        )
+        .unwrap();
+        let cache = Arc::new(
+            crate::LiquidCacheParquet::new(
+                8,
+                usize::MAX,
+                usize::MAX,
+                store,
+                Box::new(liquid_cache::cache::LiquidPolicy::new()),
+                Box::new(liquid_cache::cache::Evict),
+                Box::new(liquid_cache::cache::NoHydration::new()),
+            )
+            .await,
+        );
+        let mut options = TableParquetOptions::default();
+        options.global.pushdown_filters = pushdown;
+        let stock = ParquetSource::new(Arc::new(schema())).with_table_parquet_options(options);
+        let source = LiquidParquetSource::from_parquet_source(stock, cache);
+        let filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("a", 0)),
+            Operator::Gt,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+        ));
+        let mut config = ConfigOptions::default();
+        config.execution.parquet.pushdown_filters = pushdown;
+        source
+            .try_pushdown_filters(vec![filter], &config)
+            .unwrap()
+            .filters
+    }
+
+    #[tokio::test]
+    async fn a_filter_is_pushed_only_under_the_stock_source_s_own_setting() {
+        assert!(matches!(pushed(true).await[..], [PushedDown::Yes]));
+        assert!(matches!(pushed(false).await[..], [PushedDown::No]));
     }
 
     #[test]
