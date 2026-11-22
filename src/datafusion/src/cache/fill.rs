@@ -88,6 +88,24 @@ pub fn chunk_span(
     span
 }
 
+/// The uncompressed size of column `column` of row group `row_group`: every
+/// leaf's pages, uncompressed. 0 when the metadata has no such chunk.
+pub(crate) fn uncompressed(metadata: &ParquetMetaData, row_group: usize, column: usize) -> usize {
+    let Some(group) = metadata.row_groups().get(row_group) else {
+        return 0;
+    };
+    let schema = metadata.file_metadata().schema_descr();
+    group
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(leaf, _)| {
+            *leaf < schema.num_columns() && schema.get_column_root_idx(*leaf) == column
+        })
+        .map(|(_, chunk)| usize::try_from(chunk.uncompressed_size()).unwrap_or(usize::MAX))
+        .fold(0, usize::saturating_add)
+}
+
 /// One column chunk's bytes, read by the Parquet reader as if they were the
 /// file: offsets are file offsets, and only the span the bytes cover reads.
 struct ChunkBytes {

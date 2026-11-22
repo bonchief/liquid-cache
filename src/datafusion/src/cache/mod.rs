@@ -84,19 +84,49 @@ impl ParquetFileIdentity {
 /// One column of a row group: (file column index, field, lineage expression, is-predicate).
 type CachedColumnSpec = (u64, Arc<Field>, Option<Arc<CacheExpression>>, bool);
 
+/// The batches one read of a row group holds for itself.
+///
+/// A batch read from a disk object keeps the object read's
+/// [`ReadCharge`](liquid_cache::cache::ReadCharge), so the memory the read
+/// holds stays charged against the cache's read budget until the read lets
+/// go of the last batch of that object.
 #[derive(Default, Debug)]
 pub(crate) struct RowGroupSnapshots {
-    entries: RwLock<AHashMap<EntryID, Arc<CacheEntry>>>,
+    entries: RwLock<AHashMap<EntryID, Snapshot>>,
     selections: RwLock<AHashMap<BatchID, BooleanBuffer>>,
+}
+
+#[derive(Debug)]
+struct Snapshot {
+    entry: Arc<CacheEntry>,
+    _charge: Option<Arc<liquid_cache::cache::ReadCharge>>,
 }
 
 impl RowGroupSnapshots {
     pub(crate) fn get(&self, entry_id: &EntryID) -> Option<Arc<CacheEntry>> {
-        self.entries.read().unwrap().get(entry_id).cloned()
+        self.entries
+            .read()
+            .unwrap()
+            .get(entry_id)
+            .map(|snapshot| Arc::clone(&snapshot.entry))
     }
 
     pub(crate) fn insert(&self, entry_id: EntryID, entry: Arc<CacheEntry>) {
-        self.entries.write().unwrap().insert(entry_id, entry);
+        self.insert_charged(entry_id, entry, None);
+    }
+
+    /// Hold `entry`, read from disk under `charge`.
+    pub(crate) fn insert_charged(
+        &self,
+        entry_id: EntryID,
+        entry: Arc<CacheEntry>,
+        charge: Option<Arc<liquid_cache::cache::ReadCharge>>,
+    ) {
+        let snapshot = Snapshot {
+            entry,
+            _charge: charge,
+        };
+        self.entries.write().unwrap().insert(entry_id, snapshot);
     }
 
     pub(crate) fn selection(&self, batch_id: BatchID) -> Option<BooleanBuffer> {
@@ -123,13 +153,14 @@ impl RowGroupSnapshots {
     /// Test-only: (entry count, sum of `CacheEntry::memory_usage_bytes`).
     pub(crate) fn test_entry_count_and_bytes(&self) -> (usize, usize) {
         let entries = self.entries.read().unwrap();
-        let bytes = entries.values().map(|e| e.memory_usage_bytes()).sum();
+        let bytes = entries.values().map(|e| e.entry.memory_usage_bytes()).sum();
         (entries.len(), bytes)
     }
 
     /// Test-only: every snapshot entry this map holds.
     pub(crate) fn test_entries(&self) -> Vec<Arc<CacheEntry>> {
-        self.entries.read().unwrap().values().cloned().collect()
+        let entries = self.entries.read().unwrap();
+        entries.values().map(|e| Arc::clone(&e.entry)).collect()
     }
 }
 
@@ -769,7 +800,10 @@ impl LiquidCacheParquet {
     /// the caller's thread, to Liquid where that is smaller, else Arrow, and
     /// the chunk goes in whole or not at all. A chunk the cache holds whole
     /// already is left as it is. Bad bytes are an error, never a panic.
-    /// Returns how many batches went in.
+    /// What the fill holds while it runs is charged against the cache's
+    /// read budget ([`liquid_cache::cache::ReadBudget`]); a fill that does
+    /// not fit is refused ([`FillError::Full`]). Returns how many batches
+    /// went in.
     pub async fn fill(
         &self,
         file: ParquetFileIdentity,
@@ -822,14 +856,37 @@ impl LiquidCacheParquet {
         if self.holds_all(&file, &[(rg, rows)], &[col]) == [true] {
             return Ok(0);
         }
+        // The chunk's bytes, its decoded batches and their encoded forms,
+        // charged against the read budget: first by the chunk's uncompressed
+        // size, then by what the decode and the encode hold.
+        let reads = self.cache_store.reads();
+        let estimate = fill::uncompressed(reader.metadata(), row_group, column)
+            .saturating_mul(2)
+            .saturating_add(bytes.len());
+        let held = bytes.len();
+        let charge = reads.try_take(estimate).ok_or(FillError::Full)?;
         let arrays = fill::decode(&reader, row_group, column, bytes, self.batch_size())?;
+        let decoded: usize = arrays
+            .iter()
+            .map(|array| array.get_array_memory_size())
+            .sum();
+        if !charge.grow(held.saturating_add(decoded)) {
+            return Err(FillError::Full);
+        }
         let path = ColumnAccessPath::new(cached.key.slot as u64, rg, col);
         let mut batches = Vec::with_capacity(arrays.len());
+        let mut encoded = 0usize;
         for (batch, array) in arrays.iter().enumerate() {
             let batch = u16::try_from(batch).map_err(|_| FillError::NoSuchChunk)?;
             let id = path.entry_id(BatchID::from_raw(batch));
-            batches.push((id.into(), LiquidCache::encode(array)));
+            let entry = LiquidCache::encode(array);
+            encoded = encoded.saturating_add(entry.memory_usage_bytes());
+            batches.push((id.into(), entry));
         }
+        if !charge.grow(held.saturating_add(decoded).saturating_add(encoded)) {
+            return Err(FillError::Full);
+        }
+        drop(arrays);
         let count = batches.len();
         self.cache_store
             .insert_chunk(cached.key.identity, batches)
@@ -1942,6 +1999,46 @@ mod fill_tests {
         let same = cache.register_or_get_file(identity(), schema());
         let column = same.create_row_group(0, vec![]).get_column(0).unwrap();
         assert!(column.contains(BatchID::from_raw(0)));
+    }
+
+    #[tokio::test]
+    async fn disk_reads_and_fills_hold_memory_against_the_read_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path()).await;
+        let (bytes, metadata) = file();
+        let reads = Arc::clone(cache.storage().reads());
+
+        // A fill that does not fit the budget is refused, and gives it back.
+        reads.set_max(16);
+        let refused = fill(&cache, &metadata, 0, 0, chunk(&bytes, &metadata, 0, 0)).await;
+        assert!(matches!(refused, Err(FillError::Full)), "{refused:?}");
+        assert_eq!(reads.used(), 0);
+        reads.set_max(liquid_cache::cache::ReadBudget::DEFAULT_MAX);
+        fill(&cache, &metadata, 0, 0, chunk(&bytes, &metadata, 0, 0))
+            .await
+            .unwrap();
+        assert_eq!(reads.used(), 0, "a fill holds its charge only while it runs");
+        cache.flush_data().await.unwrap();
+
+        // A held read keeps what it read, and its charge, until the row
+        // group's read lets go of its batches.
+        let handle = cache.register_or_get_file(identity(), schema());
+        let group = handle.create_row_group(0, vec![]);
+        let column = group.get_column(0).unwrap();
+        assert!(column.held_entry(BatchID::from_raw(0)).await.is_some());
+        let held = reads.used();
+        assert!(held > 0);
+        group.release_snapshot_batch(BatchID::from_raw(0));
+        group.release_snapshot_batch(BatchID::from_raw(1));
+        assert_eq!(reads.used(), 0);
+
+        // Refused, a held read is a miss: the reader reads Parquet instead.
+        reads.set_max(held - 1);
+        let group = handle.create_row_group(0, vec![]);
+        let column = group.get_column(0).unwrap();
+        assert!(column.held_entry(BatchID::from_raw(0)).await.is_none());
+        assert_eq!(reads.used(), 0);
+        assert_eq!(cache.holds_all(&identity(), &[(0, ROWS)], &[0]), [true]);
     }
 
     #[tokio::test]

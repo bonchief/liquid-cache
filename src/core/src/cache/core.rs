@@ -19,7 +19,7 @@ use super::{
 use crate::cache::policies::{EvictionOutcome, EvictionPolicy};
 use crate::cache::utils::arrow_to_bytes;
 use crate::cache::{CacheExpression, LiquidExpr, index::ArtIndex, utils::EntryID};
-use crate::cache::{CacheFull, CacheStats, EventTrace};
+use crate::cache::{CacheFull, CacheStats, EventTrace, ReadBudget, ReadCharge};
 use crate::sync::Arc;
 
 // CacheStats and RuntimeStats moved to stats.rs
@@ -76,6 +76,19 @@ pub struct LiquidCache {
     /// The bounds on transcoding inserted byte arrays to Liquid in the
     /// background, once turned on ([`Self::transcode_text_in_background`]).
     background_text: std::sync::OnceLock<Transcodes>,
+    /// What disk reads and fills hold in memory outside the budget.
+    reads: Arc<ReadBudget>,
+}
+
+/// One read of a chunk's object: its batches decoded, and the charge their
+/// memory holds against the cache's [`ReadBudget`] until every one of them,
+/// and this charge, is dropped.
+#[derive(Debug, Default)]
+pub struct ChunkRead {
+    /// Each batch the index still holds on disk, decoded.
+    pub entries: Vec<(EntryID, Arc<CacheEntry>)>,
+    /// Held by whoever keeps the batches; `None` when nothing was read.
+    pub charge: Option<Arc<ReadCharge>>,
 }
 
 /// How many background transcodes may run, and how many more may wait.
@@ -987,7 +1000,14 @@ impl LiquidCache {
             chunk_mask,
             events: TierEvents::default(),
             background_text: std::sync::OnceLock::new(),
+            reads: ReadBudget::new(ReadBudget::DEFAULT_MAX),
         }
+    }
+
+    /// What disk reads and fills hold in memory outside the memory budget,
+    /// and its bound; see [`ReadBudget`].
+    pub fn reads(&self) -> &Arc<ReadBudget> {
+        &self.reads
     }
 
     /// Install `to_insert` under `entry_id`, if the memory budget allows.
@@ -1864,22 +1884,26 @@ impl LiquidCache {
     /// chunk's buffer, so an array decoded from it and kept in memory is
     /// charged for what it holds and pins no other batch's bytes.
     async fn read_disk_bytes(&self, entry_id: &EntryID, identity: u64) -> Option<Bytes> {
-        let object = self.read_object(entry_id, identity).await?;
+        let (object, _charge) = self.read_object(entry_id, identity).await?;
         let (_, bytes) = object.batch(entry_id)?;
         Some(Bytes::copy_from_slice(&bytes))
     }
 
     /// The object `entry_id` names, read whole, if written for `identity`;
-    /// failures as [`Self::read_disk_bytes`].
+    /// failures as [`Self::read_disk_bytes`]. The read is charged twice its
+    /// buffer against [`Self::reads`] (the buffer, and the batches decoded
+    /// from it) before it allocates; a read that does not fit is a plain
+    /// miss, and the caller reads the rows elsewhere.
     async fn read_object(
         &self,
         entry_id: &EntryID,
         identity: u64,
-    ) -> Option<crate::cache::disk::ChunkObject> {
+    ) -> Option<(crate::cache::disk::ChunkObject, ReadCharge)> {
         let key = ObjectKey::new(self.chunk_of(entry_id), identity);
-        match self.store.get_chunk(*entry_id, key).await {
-            Ok(object) => Some(object),
-            Err(DiskError::NotFound | DiskError::Foreign) => None,
+        let charge = |held: usize| self.reads.try_take(held.saturating_mul(2));
+        match self.store.get_chunk_charged(*entry_id, key, charge).await {
+            Ok(read) => Some(read),
+            Err(DiskError::NotFound | DiskError::Foreign | DiskError::Refused) => None,
             Err(error) => {
                 self.observer.on_disk_read_failure(&error);
                 drop(error);
@@ -1920,21 +1944,21 @@ impl LiquidCache {
     /// immutable source, so any object listing an entry under that identity
     /// holds that entry's bytes, even one a newer write has since replaced.
     /// A batch that does not decode is counted and its record dropped.
-    pub async fn read_chunk(
-        &self,
-        entry_id: &EntryID,
-        identity: u64,
-    ) -> Vec<(EntryID, Arc<CacheEntry>)> {
+    ///
+    /// The batches' memory stays charged against [`Self::reads`] until they
+    /// and the returned charge are dropped. A read the budget refuses
+    /// returns nothing, as a miss.
+    pub async fn read_chunk(&self, entry_id: &EntryID, identity: u64) -> ChunkRead {
         let Some(slot) = self.index.get_for(entry_id, identity) else {
-            return Vec::new();
+            return ChunkRead::default();
         };
         if Self::charged_bytes(&slot.entry).is_none() {
-            return Vec::new();
+            return ChunkRead::default();
         }
         self.cache_policy
             .notify_access(entry_id, CachedBatchType::from(&slot.entry));
-        let Some(object) = self.read_object(entry_id, identity).await else {
-            return Vec::new();
+        let Some((object, charge)) = self.read_object(entry_id, identity).await else {
+            return ChunkRead::default();
         };
         let mut read = Vec::new();
         let mut unreadable = Vec::new();
@@ -1953,7 +1977,10 @@ impl LiquidCache {
         for entry in unreadable {
             self.drop_unreadable(entry, identity).await;
         }
-        read
+        ChunkRead {
+            entries: read,
+            charge: Some(Arc::new(charge)),
+        }
     }
 
     /// Read `entries` held on disk for `identity` back into memory, one
@@ -1969,7 +1996,7 @@ impl LiquidCache {
             else {
                 continue;
             };
-            let Some(object) = self.read_object(first, identity).await else {
+            let Some((object, _charge)) = self.read_object(first, identity).await else {
                 continue;
             };
             let mut installed = 0;

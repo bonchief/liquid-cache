@@ -53,6 +53,9 @@ pub enum DiskError {
     Io(std::io::Error),
     /// The store's I/O threads are gone.
     Closed,
+    /// The caller of [`DiskStore::get_chunk_charged`] declined the read: no
+    /// room to hold what it would allocate.
+    Refused,
 }
 
 impl std::fmt::Display for DiskError {
@@ -66,6 +69,7 @@ impl std::fmt::Display for DiskError {
             Self::Full => out.write_str("the disk tier has no free extent long enough"),
             Self::Io(error) => write!(out, "disk tier I/O failed: {error}"),
             Self::Closed => out.write_str("the disk tier's I/O threads have stopped"),
+            Self::Refused => out.write_str("the disk tier read was refused: no room to hold it"),
         }
     }
 }
@@ -303,6 +307,21 @@ impl DiskStore {
         entry: EntryID,
         chunk: ObjectKey,
     ) -> Result<ChunkObject, DiskError> {
+        self.get_chunk_charged(entry, chunk, |_| Some(()))
+            .await
+            .map(|(object, ())| object)
+    }
+
+    /// [`Self::get_chunk`], once `charge` has agreed to the bytes the read
+    /// allocates (its buffer: the object's extent and a page to align it),
+    /// before it allocates them: what `charge` returned, with the object.
+    /// `None` from `charge` refuses the read ([`DiskError::Refused`]).
+    pub async fn get_chunk_charged<T>(
+        &self,
+        entry: EntryID,
+        chunk: ObjectKey,
+        charge: impl FnOnce(usize) -> Option<T>,
+    ) -> Result<(ChunkObject, T), DiskError> {
         let (at, len) = self
             .shared
             .extents()
@@ -312,6 +331,11 @@ impl DiskStore {
             shared: Arc::clone(&self.shared),
             at,
         };
+        let held = usize::try_from(len)
+            .ok()
+            .and_then(|len| len.checked_add(PAGE as usize))
+            .ok_or(DiskError::Corrupt)?;
+        let charged = charge(held).ok_or(DiskError::Refused)?;
         let shared = Arc::clone(&self.shared);
         let (buffer, payload) = self
             .pool
@@ -328,7 +352,7 @@ impl DiskStore {
                 return Err(DiskError::Corrupt);
             }
         };
-        Ok(ChunkObject::new(payload, directory))
+        Ok((ChunkObject::new(payload, directory), charged))
     }
 
     /// Forget `entry`'s object; whether it had one. Its extent is freed once

@@ -11,11 +11,12 @@ mod io_context;
 pub(crate) mod liquid_expr;
 mod observer;
 pub mod policies;
+mod reads;
 mod utils;
 
 pub use builders::{EvaluatePredicate, Get, Insert, LiquidCacheBuilder, default_max_memory_bytes};
 pub use cached_batch::{CacheEntry, CachedBatchType};
-pub use core::{FormHoldings, LiquidCache, PrefetchResult, TierCounters};
+pub use core::{ChunkRead, FormHoldings, LiquidCache, PrefetchResult, TierCounters};
 pub use disk::{
     ChunkObject, DiskError, DiskFile, DiskOptions, DiskStore, FileIo, ObjectKey, StoredBatch,
 };
@@ -29,6 +30,7 @@ pub use policies::{
     AlwaysHydrate, CachePolicy, ChunkCounts, Evict, EvictionPolicy, HydrationPolicy,
     HydrationRequest, LiquidPolicy, MaterializedEntry, NoHydration, TranscodeEvict,
 };
+pub use reads::{ReadBudget, ReadCharge};
 pub use utils::EntryID;
 
 /// The cache could not reserve enough disk budget for a write.

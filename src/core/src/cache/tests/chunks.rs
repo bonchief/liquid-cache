@@ -2,8 +2,7 @@
 //! together, never one batch alone.
 
 use crate::cache::{
-    CachedBatchType, DiskOptions, DiskStore, EntryID, Evict, LiquidCache, LiquidCacheBuilder,
-    LiquidPolicy,
+    DiskOptions, DiskStore, EntryID, Evict, LiquidCache, LiquidCacheBuilder, LiquidPolicy,
 };
 use arrow::array::{Array, ArrayRef, Int64Array};
 use std::sync::Arc;
@@ -21,6 +20,10 @@ fn array(seed: i64) -> ArrayRef {
     Arc::new(Int64Array::from_iter_values(
         (0..1024).map(|value| value * 7919 + seed),
     ))
+}
+
+fn array_of(seed: usize) -> ArrayRef {
+    array(seed as i64)
 }
 
 fn batch_bytes() -> usize {
@@ -79,18 +82,19 @@ async fn a_chunk_is_spilled_whole_in_one_object() {
     assert_eq!(counters.disk_arrow.entries, BATCHES);
     assert_eq!(counters.chunks.disk, 1);
 
-    // One read brings back every batch of the chunk, and moves nothing.
+    // One read brings back every batch of the chunk, each holding the
+    // values inserted for it, and moves nothing.
     let read = cache.read_chunk(&entry(1, 1), 0).await;
-    assert_eq!(read.len(), BATCHES);
-    for (id, batch) in read {
-        assert_eq!(
-            CachedBatchType::from(batch.as_ref()),
-            CachedBatchType::MemoryArrow
-        );
-        let index = usize::from(id) & ((1 << CHUNK_BITS) - 1);
-        let held = cache.get(&id, 0).read().await.unwrap();
-        assert_eq!(held.as_ref(), array((10 + index) as i64).as_ref());
+    assert_eq!(read.entries.len(), BATCHES);
+    assert!(read.charge.is_some());
+    for (id, batch) in &read.entries {
+        let index = usize::from(*id) & ((1 << CHUNK_BITS) - 1);
+        let crate::cache::CacheEntry::MemoryArrow(array) = batch.as_ref() else {
+            panic!("batch {index} read back as {batch}");
+        };
+        assert_eq!(array.as_ref(), array_of(10 + index).as_ref());
     }
+    drop(read);
     assert_eq!(tiers(&cache, 1), vec![Some(true); BATCHES]);
 }
 
@@ -244,6 +248,7 @@ async fn an_injected_disk_fault_takes_a_real_fault_s_path() {
         cache
             .read_chunk(&entry(spilled, on_disk), 0)
             .await
+            .entries
             .is_empty()
     );
     assert_eq!(cache.stats().runtime.disk_read_failures, 1);
@@ -252,4 +257,40 @@ async fn an_injected_disk_fault_takes_a_real_fault_s_path() {
     cache.insert(entry(4, 0), 0, array(40)).await.unwrap();
     let held = cache.get(&entry(4, 0), 0).read().await.unwrap();
     assert_eq!(held.as_ref(), array(40).as_ref());
+}
+
+#[tokio::test]
+async fn a_disk_read_holds_its_memory_against_the_read_budget() {
+    let cache = cache(1 << 30, None).await;
+    insert_chunk(&cache, 1).await;
+    cache.insert(entry(2, 0), 0, array(20)).await.unwrap();
+    assert_eq!(tiers(&cache, 1), vec![Some(true); BATCHES]);
+
+    // A read is charged before it allocates, and holds the charge while
+    // its batches live.
+    let read = cache.read_chunk(&entry(1, 0), 0).await;
+    let charged = read.charge.as_ref().unwrap().bytes();
+    assert!(charged > 0);
+    assert_eq!(cache.reads().used(), charged);
+    let kept = read.entries.clone();
+    drop(read);
+    assert_eq!(cache.reads().used(), 0, "the charge goes with the read");
+    drop(kept);
+
+    // Under a bound one read does not fit, a read is refused as a miss:
+    // nothing is allocated, nothing is dropped, and it is counted.
+    cache.reads().set_max(charged - 1);
+    let refused = cache.read_chunk(&entry(1, 0), 0).await;
+    assert!(refused.entries.is_empty() && refused.charge.is_none());
+    assert_eq!(cache.reads().refused(), 1);
+    assert_eq!(cache.reads().used(), 0);
+    assert_eq!(tiers(&cache, 1), vec![Some(true); BATCHES]);
+    assert_eq!(cache.stats().runtime.disk_read_failures, 0);
+    assert!(cache.get(&entry(1, 0), 0).read().await.is_none());
+
+    cache.reads().set_max(charged);
+    assert_eq!(
+        cache.read_chunk(&entry(1, 0), 0).await.entries.len(),
+        BATCHES
+    );
 }

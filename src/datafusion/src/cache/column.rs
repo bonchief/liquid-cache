@@ -116,7 +116,9 @@ impl CachedColumn {
     /// the whole run. The read keeps the chunk's later batches as snapshots,
     /// so the batches after this one are served from the same read buffer;
     /// earlier ones were served already and are not kept. Nothing is
-    /// inserted into the cache.
+    /// inserted into the cache. The kept batches hold the read's charge
+    /// against the cache's read budget; a read the budget refuses is a miss,
+    /// and the caller reads the rows from Parquet.
     pub(crate) async fn held_entry(&self, batch_id: BatchID) -> Option<Arc<CacheEntry>> {
         let entry_id = self.entry_id(batch_id).into();
         if let Some(entry) = self.snapshots.get(&entry_id) {
@@ -126,17 +128,18 @@ impl CachedColumn {
             return None;
         }
         let mut found = None;
-        for (id, entry) in self
+        let read = self
             .cache_store
             .read_chunk(&entry_id, self.file_identity)
-            .await
-        {
+            .await;
+        for (id, entry) in read.entries {
             let batch = ParquetArrayID::from(id).batch_id_inner();
             if id == entry_id {
                 found = Some(Arc::clone(&entry));
             }
             if batch >= u64::from(*batch_id) {
-                self.snapshots.insert(id, entry);
+                self.snapshots
+                    .insert_charged(id, entry, read.charge.clone());
             }
         }
         found
