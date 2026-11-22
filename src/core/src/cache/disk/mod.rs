@@ -98,6 +98,7 @@ pub struct DiskOptions {
     capacity: u64,
     direct: bool,
     threads: usize,
+    writers: usize,
     layer: Option<Layer>,
 }
 
@@ -107,6 +108,7 @@ impl std::fmt::Debug for DiskOptions {
             .field("capacity", &self.capacity)
             .field("direct", &self.direct)
             .field("threads", &self.threads)
+            .field("writers", &self.writers)
             .field("layered", &self.layer.is_some())
             .finish()
     }
@@ -117,12 +119,14 @@ impl DiskOptions {
     pub const DEFAULT_CAPACITY: u64 = 16 << 30;
 
     /// A store of at most `capacity` bytes (rounded down to whole pages),
-    /// read and written through the page cache, on four I/O threads.
+    /// read and written through the page cache, read on four I/O threads
+    /// and written on one.
     pub fn new(capacity: u64) -> Self {
         Self {
             capacity,
             direct: false,
             threads: 4,
+            writers: 1,
             layer: None,
         }
     }
@@ -151,9 +155,17 @@ impl DiskOptions {
         self
     }
 
-    /// The most reads and writes in flight at once.
+    /// The most reads in flight at once.
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.threads = threads.max(1);
+        self
+    }
+
+    /// The most writes in flight at once. Writes, with their writeback,
+    /// run on threads of their own, so a spill never queues ahead of a
+    /// query's read.
+    pub fn with_writers(mut self, writers: usize) -> Self {
+        self.writers = writers.max(1);
         self
     }
 
@@ -225,7 +237,10 @@ impl ObjectKey {
 #[derive(Clone, Debug)]
 pub struct DiskStore {
     shared: Arc<Shared>,
+    /// Runs reads.
     pool: Arc<Pool>,
+    /// Runs writes and their writeback, apart from reads.
+    writers: Arc<Pool>,
 }
 
 #[derive(Debug)]
@@ -246,7 +261,8 @@ impl DiskStore {
             Some(layer) => layer(file),
             None => Arc::new(file),
         };
-        let pool = Pool::start(options.threads)?;
+        let pool = Pool::start("liquid-disk-read", options.threads)?;
+        let writers = Pool::start("liquid-disk-write", options.writers)?;
         Ok(Self {
             shared: Arc::new(Shared {
                 file,
@@ -254,6 +270,7 @@ impl DiskStore {
                 mismatches: AtomicU64::new(0),
             }),
             pool: Arc::new(pool),
+            writers: Arc::new(writers),
         })
     }
 
@@ -299,7 +316,7 @@ impl DiskStore {
         };
         let writing = hold.again();
         let shared = Arc::clone(&self.shared);
-        self.pool
+        self.writers
             .run(move || {
                 let _writing = writing;
                 shared.write(chunk, &batches, at, len)
@@ -782,6 +799,70 @@ mod tests {
         assert_eq!(store.mismatches(), 0);
         faults.reads.store(false, Ordering::Relaxed);
         assert!(store.get_chunk(entry, key).await.is_ok());
+    }
+
+    /// The real file, whose writeback waits until `open` is set.
+    #[derive(Debug)]
+    struct SlowWriteback {
+        file: FileIo,
+        open: Arc<AtomicBool>,
+    }
+
+    impl DiskFile for SlowWriteback {
+        fn read_exact_at(&self, buffer: &mut [u8], at: u64) -> std::io::Result<()> {
+            self.file.read_exact_at(buffer, at)
+        }
+
+        fn write_all_at(&self, buffer: &[u8], at: u64) -> std::io::Result<()> {
+            self.file.write_all_at(buffer, at)
+        }
+
+        fn sync(&self, at: u64, len: u64) -> std::io::Result<()> {
+            while !self.open.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            self.file.sync(at, len)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_never_queues_behind_a_write_s_writeback() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = Arc::new(AtomicBool::new(true));
+        let gate = Arc::clone(&open);
+        let options = DiskOptions::new(1 << 20)
+            .with_threads(1)
+            .with_writers(1)
+            .with_file(move |file| {
+                Arc::new(SlowWriteback {
+                    file,
+                    open: Arc::clone(&gate),
+                })
+            });
+        let store = DiskStore::mount(dir.path().join("tier.disk"), options).unwrap();
+        let key = ObjectKey::new(chunk(1), 7);
+        store
+            .put_chunk(key, batches(chunk(1), 2, 100))
+            .await
+            .unwrap();
+
+        // A spill stuck in writeback holds the one writer thread.
+        open.store(false, Ordering::Release);
+        let writing = store.clone();
+        let spill = tokio::spawn(async move {
+            let other = ObjectKey::new(chunk(2), 7);
+            writing.put_chunk(other, batches(chunk(2), 1, 100)).await
+        });
+        // Let the spill reach its thread first.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        // The read thread is free: the read completes while it waits.
+        let read = store.get_chunk(batch(chunk(1), 0), key).await;
+        assert!(read.is_ok());
+        assert!(!spill.is_finished());
+        open.store(true, Ordering::Release);
+        spill.await.unwrap().unwrap();
     }
 
     #[tokio::test]

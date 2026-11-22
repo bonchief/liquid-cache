@@ -96,7 +96,9 @@ impl DiskFile for FileIo {
     }
 }
 
-/// A fixed set of threads that run the store's `pread`s and `pwrite`s.
+/// A fixed set of threads that run the store's `pread`s, or its `pwrite`s
+/// and their writeback: a store has one of each, so a write waiting on
+/// writeback never holds up a read.
 ///
 /// At most as many operations as there are threads touch the file at once;
 /// the rest wait in the queue. io_uring is not used: the seccomp profile the
@@ -108,13 +110,13 @@ pub(super) struct Pool {
 }
 
 impl Pool {
-    pub(super) fn start(threads: usize) -> std::io::Result<Self> {
+    pub(super) fn start(name: &str, threads: usize) -> std::io::Result<Self> {
         let (jobs, queue) = mpsc::channel::<Job>();
         let queue = Arc::new(Mutex::new(queue));
         for index in 0..threads.max(1) {
             let queue = Arc::clone(&queue);
             std::thread::Builder::new()
-                .name(format!("liquid-disk-{index}"))
+                .name(format!("{name}-{index}"))
                 .spawn(move || Self::serve(&queue))?;
         }
         Ok(Self { jobs })
