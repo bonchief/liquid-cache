@@ -24,8 +24,6 @@ fastrace = { workspace = true }
 parquet-variant-json = { workspace = true }
 serde_json = { workspace = true }
 
-t4 = { workspace = true }
-
 [dev-dependencies]
 tempfile = "3.27.0"
 divan = "0.1"

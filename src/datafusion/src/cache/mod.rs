@@ -536,7 +536,7 @@ impl LiquidCacheParquet {
         batch_size: usize,
         max_memory_bytes: usize,
         max_disk_bytes: usize,
-        store: t4::Store,
+        store: liquid_cache::cache::DiskStore,
         cache_policy: Box<dyn CachePolicy>,
         eviction_policy: Box<dyn EvictionPolicy>,
         hydration_policy: Box<dyn HydrationPolicy>,
@@ -561,7 +561,7 @@ impl LiquidCacheParquet {
         batch_size: usize,
         max_memory_bytes: usize,
         max_disk_bytes: usize,
-        store: t4::Store,
+        store: liquid_cache::cache::DiskStore,
         cache_policy: Box<dyn CachePolicy>,
         eviction_policy: Box<dyn EvictionPolicy>,
         hydration_policy: Box<dyn HydrationPolicy>,
@@ -823,9 +823,11 @@ mod tests {
 
     async fn setup_cache(batch_size: usize, schema: SchemaRef) -> CachedRowGroupRef {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
-            .await
-            .unwrap();
+        let store = liquid_cache::cache::DiskStore::mount(
+            tmp_dir.path().join("liquid_cache.disk"),
+            liquid_cache::cache::DiskOptions::default(),
+        )
+        .unwrap();
         let cache = LiquidCacheParquet::new(
             batch_size,
             usize::MAX,
@@ -849,9 +851,11 @@ mod tests {
         max_memory_bytes: usize,
     ) -> CachedRowGroupRef {
         let tmp_dir = tempfile::tempdir().unwrap();
-        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
-            .await
-            .unwrap();
+        let store = liquid_cache::cache::DiskStore::mount(
+            tmp_dir.path().join("liquid_cache.disk"),
+            liquid_cache::cache::DiskOptions::default(),
+        )
+        .unwrap();
         let cache = LiquidCacheParquet::new(
             batch_size,
             max_memory_bytes,
@@ -1228,9 +1232,11 @@ mod tests {
     async fn files_whose_keys_collide_do_not_share_entries() {
         let batch_size = 64;
         let tmp_dir = tempfile::tempdir().unwrap();
-        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
-            .await
-            .unwrap();
+        let store = liquid_cache::cache::DiskStore::mount(
+            tmp_dir.path().join("liquid_cache.disk"),
+            liquid_cache::cache::DiskOptions::default(),
+        )
+        .unwrap();
         let cache = LiquidCacheParquet::new(
             batch_size,
             usize::MAX,
@@ -1303,7 +1309,11 @@ mod registry_tests {
 
     /// A memory-only cache (no disk tier) that holds `batches` batches.
     async fn memory_only_cache(dir: &std::path::Path, batches: usize) -> LiquidCacheParquet {
-        let store = t4::mount(dir.join("liquid_cache.t4")).await.unwrap();
+        let store = liquid_cache::cache::DiskStore::mount(
+            dir.join("liquid_cache.disk"),
+            liquid_cache::cache::DiskOptions::default(),
+        )
+        .unwrap();
         LiquidCacheParquet::new(
             BATCH,
             batch_data(0).get_array_memory_size() * batches,

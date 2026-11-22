@@ -19,7 +19,7 @@ use vortex_array::{ArrayContext, ArrayId, IntoArray, VortexSessionExecute};
 use vortex_arrow::ArrowSessionExt;
 use vortex_btrblocks::BtrBlocksCompressor;
 use vortex_buffer::{Alignment, BitBuffer, ByteBuffer, ByteBufferMut};
-use vortex_error::VortexResult;
+use vortex_error::{VortexResult, vortex_bail, vortex_err};
 use vortex_fsst::FSST;
 use vortex_ipc::messages::{BufMessageReader, DecoderMessage, EncoderMessage, MessageEncoder};
 use vortex_mask::Mask;
@@ -126,8 +126,36 @@ impl LiquidArray {
     }
 
     /// Deserialize a Vortex-backed Liquid array.
+    ///
+    /// # Panics
+    ///
+    /// If `bytes` is not a serialized Liquid array. Bytes that come from
+    /// outside the process, such as the disk tier's, go through
+    /// [`Self::try_from_bytes`] instead.
     pub fn from_bytes(bytes: Bytes) -> Self {
-        Self::decode(ByteBuffer::from(bytes))
+        Self::try_from_bytes(bytes)
+            .unwrap_or_else(|error| panic!("invalid serialized Liquid array: {error}"))
+    }
+
+    /// Deserialize a Vortex-backed Liquid array, or say why `bytes` is not
+    /// one.
+    ///
+    /// Every check of the framing this crate writes fails as an error rather
+    /// than an assertion: a short or truncated block, a wrong magic or
+    /// version, an alignment the reader refuses, a section running past the
+    /// end, an Arrow type, dtype or encoding list that does not parse, and a
+    /// segment Vortex will not decode. The disk tier checksums its objects
+    /// before they reach this, so a mismatch here means bytes this version
+    /// did not write.
+    pub fn try_from_bytes(bytes: Bytes) -> VortexResult<Self> {
+        Self::try_decode(ByteBuffer::from(bytes))
+    }
+
+    /// Decode a block this process serialized itself, in [`Self::compacted`].
+    fn decode(block: ByteBuffer) -> Self {
+        Self::try_decode(block).unwrap_or_else(|error| {
+            panic!("a Liquid array this process encoded must decode: {error}")
+        })
     }
 
     /// Decode a serialized block, keeping every buffer of the result a
@@ -138,51 +166,57 @@ impl LiquidArray {
     /// [`Self::encode`] pads every buffer to its alignment relative to the
     /// block's start; this aligns the start itself, copying the block once
     /// if the caller's allocation is not aligned enough.
-    fn decode(block: ByteBuffer) -> Self {
-        validate_header(&block);
-        let alignment = Alignment::try_from_untrusted_exponent(block[ALIGNMENT_OFFSET])
-            .expect("valid Liquid array alignment");
+    fn try_decode(block: ByteBuffer) -> VortexResult<Self> {
+        check_header(&block)?;
+        let alignment = Alignment::try_from_untrusted_exponent(block[ALIGNMENT_OFFSET])?;
         // Align the start, then drop the requirement so sections slice freely.
         let block = block.aligned(alignment).aligned(Alignment::none());
 
         let mut cursor = HEADER_SIZE;
-        let mut next_section = || {
+        let mut next_section = || -> VortexResult<std::ops::Range<usize>> {
             let start = cursor + 4;
-            cursor = start + read_u32(&block, cursor) as usize;
-            start..cursor
+            let len = try_read_u32(&block, cursor)? as usize;
+            let end = start
+                .checked_add(len)
+                .filter(|end| *end <= block.len())
+                .ok_or_else(|| vortex_err!("serialized Liquid array section runs past its end"))?;
+            cursor = end;
+            Ok(start..end)
         };
-        let arrow_type = next_section();
-        let dtype_message = next_section();
-        let encodings = next_section();
-        let row_count = read_u32(&block, cursor) as usize;
+        let arrow_type = next_section()?;
+        let dtype_message = next_section()?;
+        let encodings = next_section()?;
+        let row_count = try_read_u32(&block, cursor)? as usize;
         let segment_start = (cursor + 4).next_multiple_of(alignment.as_usize());
+        if segment_start > block.len() {
+            vortex_bail!("serialized Liquid array has no array segment");
+        }
 
-        let arrow_type =
-            serde_json::from_slice(&block[arrow_type]).expect("valid serialized Arrow data type");
-        let encodings: Vec<String> =
-            serde_json::from_slice(&block[encodings]).expect("valid serialized encoding ids");
+        let arrow_type: DataType = serde_json::from_slice(&block[arrow_type])
+            .map_err(|error| vortex_err!("invalid serialized Arrow data type: {error}"))?;
+        let encodings: Vec<String> = serde_json::from_slice(&block[encodings])
+            .map_err(|error| vortex_err!("invalid serialized encoding ids: {error}"))?;
         let encodings: Vec<ArrayId> = encodings.iter().map(|id| ArrayId::new(id)).collect();
         let mut reader = BufMessageReader::new(block.slice(dtype_message).into_bytes());
         let dtype = match reader
             .next()
-            .expect("Vortex dtype message")
-            .expect("valid Vortex IPC")
+            .ok_or_else(|| vortex_err!("serialized Liquid array has no Vortex dtype message"))??
         {
-            DecoderMessage::DType(dtype) => {
-                DType::from_flatbuffer(dtype, &SESSION).expect("valid Vortex dtype")
-            }
-            message => panic!("expected Vortex dtype message, got {message:?}"),
+            DecoderMessage::DType(dtype) => DType::from_flatbuffer(dtype, &SESSION)?,
+            message => vortex_bail!("expected Vortex dtype message, got {message:?}"),
         };
-        let array = SerializedArray::try_from(block.slice(segment_start..))
-            .expect("valid Vortex array segment")
-            .decode(&dtype, row_count, &ReadContext::new(encodings), &SESSION)
-            .expect("valid Vortex array");
+        let array = SerializedArray::try_from(block.slice(segment_start..))?.decode(
+            &dtype,
+            row_count,
+            &ReadContext::new(encodings),
+            &SESSION,
+        )?;
         let memory_size = heap_size(&array, &block) + size_of::<Self>();
-        Self {
+        Ok(Self {
             array,
             arrow_type,
             memory_size,
-        }
+        })
     }
 
     /// The serialized form, as pieces to write contiguously into a block
@@ -562,23 +596,34 @@ fn with_private_fsst_symbol_tables(
     unsafe { array.with_buffers(buffers) }
 }
 
-fn read_u32(bytes: &[u8], at: usize) -> u32 {
-    let field = bytes
-        .get(at..at + 4)
-        .expect("serialized Liquid array is truncated");
-    u32::from_le_bytes(field.try_into().expect("four bytes"))
+/// The four bytes at `at` of a serialized block, as a little-endian `u32`.
+fn try_read_u32(bytes: &[u8], at: usize) -> VortexResult<u32> {
+    at.checked_add(4)
+        .and_then(|end| bytes.get(at..end))
+        .and_then(|field| <[u8; 4]>::try_from(field).ok())
+        .map(u32::from_le_bytes)
+        .ok_or_else(|| vortex_err!("serialized Liquid array is truncated"))
 }
 
-fn validate_header(bytes: &[u8]) {
-    assert!(
-        bytes.len() >= HEADER_SIZE,
-        "value too small for Liquid array header, expected at least {HEADER_SIZE} bytes, got {}",
-        bytes.len()
-    );
-    let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-    let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-    assert_eq!(magic, MAGIC, "Invalid Liquid array magic number");
-    assert_eq!(version, VERSION, "Unsupported Liquid array version");
+fn check_header(bytes: &[u8]) -> VortexResult<()> {
+    if bytes.len() < HEADER_SIZE {
+        vortex_bail!(
+            "value too small for Liquid array header, expected at least {HEADER_SIZE} bytes, got {}",
+            bytes.len()
+        );
+    }
+    let magic = try_read_u32(bytes, 0)?;
+    let version = bytes
+        .get(4..6)
+        .and_then(|field| <[u8; 2]>::try_from(field).ok())
+        .map(u16::from_le_bytes);
+    if magic != MAGIC {
+        vortex_bail!("Invalid Liquid array magic number");
+    }
+    if version != Some(VERSION) {
+        vortex_bail!("Unsupported Liquid array version");
+    }
+    Ok(())
 }
 
 fn import_array(array: &ArrayRef) -> VortexResult<vortex_array::ArrayRef> {

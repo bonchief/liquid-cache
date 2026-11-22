@@ -39,8 +39,12 @@ fn create_boolean_filter(array_size: usize, selectivity: f64) -> BooleanBuffer {
 
 fn setup_cache() -> (Arc<CachedColumn>, tempfile::TempDir) {
     let tmp_dir = tempfile::tempdir().unwrap();
-    let store_path = tmp_dir.path().join("liquid_cache.t4");
-    let store = tokio_test::block_on(t4::mount(&store_path)).expect("failed to mount t4 store");
+    let store_path = tmp_dir.path().join("liquid_cache.disk");
+    let store = liquid_cache::cache::DiskStore::mount(
+        &store_path,
+        liquid_cache::cache::DiskOptions::default(),
+    )
+    .expect("failed to mount the disk store");
     let cache = tokio_test::block_on(LiquidCacheParquet::new(
         BATCH_SIZE,
         1024 * 1024 * 1024, // max_memory_bytes (1GB)

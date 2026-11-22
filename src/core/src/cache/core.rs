@@ -2,7 +2,7 @@ use arrow::array::cast::AsArray;
 use arrow::array::{ArrayRef, BooleanArray};
 use arrow::buffer::BooleanBuffer;
 use arrow::record_batch::RecordBatch;
-use arrow_schema::{Field, Schema};
+use arrow_schema::{ArrowError, Field, Schema};
 use bytes::Bytes;
 use futures::StreamExt;
 
@@ -10,7 +10,8 @@ use super::{
     budget::BudgetAccounting,
     builders::{EvaluatePredicate, Get, Insert},
     cached_batch::{CacheEntry, CachedBatchType},
-    io_context::{EntryMetadata, entry_id_to_key},
+    disk::{DiskError, DiskStore, ObjectKey},
+    io_context::EntryMetadata,
     observer::{CacheTracer, InternalEvent, Observer},
     policies::{CachePolicy, HydrationPolicy, HydrationRequest, MaterializedEntry},
     utils::CacheConfig,
@@ -64,7 +65,7 @@ pub struct LiquidCache {
     eviction_policy: Box<dyn EvictionPolicy>,
     observer: Arc<Observer>,
     metadata: Arc<dyn EntryMetadata>,
-    store: t4::Store,
+    store: DiskStore,
     disk_key_locks: DiskKeyLocks,
     stray_objects: StrayObjects,
     evict_victims_concurrently: bool,
@@ -273,9 +274,6 @@ pub enum PrefetchResult {
     /// The entry is not in the index, or its disk blob is gone.
     Absent,
 }
-
-/// Length of the identity trailer appended to every object written to disk.
-const IDENTITY_TRAILER_LEN: usize = std::mem::size_of::<u64>();
 
 /// Whether `slot` is the memory entry `observed`: the same array, not only an
 /// equal one, so an entry written since is not mistaken for it.
@@ -610,66 +608,52 @@ impl LiquidCache {
         self.metadata.add_lineage(entry_id, expression);
     }
 
-    /// Flush all entries to disk.
+    /// Flush all entries to disk. An entry that cannot be written, because
+    /// the disk is full, the write failed or its array does not serialise,
+    /// is dropped instead.
     pub async fn flush_all_to_disk(&self) -> Result<(), CacheFull> {
         let mut entires = Vec::new();
         self.index.for_each(|entry_id, slot| {
             entires.push((*entry_id, slot.identity, slot.entry.clone()));
         });
         for (entry_id, identity, batch) in entires {
-            match &batch {
-                CacheEntry::MemoryArrow(array) => {
-                    let bytes = arrow_to_bytes(array).expect("failed to convert arrow to bytes");
-                    let disk_bytes = bytes.len();
-                    match self
-                        .write_batch_to_disk(entry_id, identity, &batch, bytes)
-                        .await
-                    {
-                        Ok(write) => {
-                            let Orphan(None) = self
-                                .try_insert(
-                                    entry_id,
-                                    identity,
-                                    CacheEntry::disk_arrow(array.data_type().clone(), disk_bytes),
-                                    Some(write),
-                                )
-                                .expect("failed to insert disk arrow entry")
-                            else {
-                                unreachable!("a disk record leaves no orphan");
-                            };
-                        }
-                        Err(CacheFull) => self.drop_memory_entry(entry_id),
+            let (record, bytes) = match &batch {
+                CacheEntry::MemoryArrow(array) => match arrow_to_bytes(array) {
+                    Ok(bytes) => (
+                        CacheEntry::disk_arrow(array.data_type().clone(), bytes.len()),
+                        bytes,
+                    ),
+                    Err(error) => {
+                        log::warn!("dropped a cached Arrow array that does not serialise: {error}");
+                        self.drop_memory_entry(entry_id);
+                        continue;
                     }
-                }
+                },
                 CacheEntry::MemoryLiquid(liquid_array) => {
-                    let liquid_bytes = liquid_array.to_bytes();
-                    let disk_bytes = liquid_bytes.len();
-                    match self
-                        .write_batch_to_disk(entry_id, identity, &batch, Bytes::from(liquid_bytes))
-                        .await
-                    {
-                        Ok(write) => {
-                            let Orphan(None) = self
-                                .try_insert(
-                                    entry_id,
-                                    identity,
-                                    CacheEntry::disk_liquid(
-                                        liquid_array.original_arrow_data_type(),
-                                        disk_bytes,
-                                    ),
-                                    Some(write),
-                                )
-                                .expect("failed to insert disk liquid entry")
-                            else {
-                                unreachable!("a disk record leaves no orphan");
-                            };
-                        }
-                        Err(CacheFull) => self.drop_memory_entry(entry_id),
+                    let bytes = Bytes::from(liquid_array.to_bytes());
+                    (
+                        CacheEntry::disk_liquid(
+                            liquid_array.original_arrow_data_type(),
+                            bytes.len(),
+                        ),
+                        bytes,
+                    )
+                }
+                // Already on disk.
+                CacheEntry::DiskArrow { .. } | CacheEntry::DiskLiquid { .. } => continue,
+            };
+            match self
+                .write_batch_to_disk(entry_id, identity, &batch, bytes)
+                .await
+            {
+                // A disk record always installs (see `try_insert`); were it
+                // refused, dropping the write would give its charge back.
+                Ok(write) => {
+                    if let Ok(orphan) = self.try_insert(entry_id, identity, record, Some(write)) {
+                        self.reclaim(orphan).await;
                     }
                 }
-                CacheEntry::DiskArrow { .. } | CacheEntry::DiskLiquid { .. } => {
-                    // Already on disk, skip
-                }
+                Err(CacheFull) => self.drop_memory_entry(entry_id),
             }
         }
         Ok(())
@@ -690,12 +674,14 @@ impl LiquidCache {
                 let outcome = self
                     .eviction_policy
                     .evict(batch, self.metadata.lineage(&entry_id).as_deref());
-                let EvictionOutcome::Replace {
-                    entry: new_batch,
-                    bytes_to_write,
-                } = outcome
-                else {
-                    unreachable!("memory Arrow eviction cannot remove entry");
+                let (new_batch, bytes_to_write) = match outcome {
+                    EvictionOutcome::Replace {
+                        entry,
+                        bytes_to_write,
+                    } => (entry, bytes_to_write),
+                    // The policy found no form to keep the array in; the
+                    // insert is refused and nothing is cached.
+                    EvictionOutcome::Drop | EvictionOutcome::Remove => return Err(CacheFull),
                 };
                 let write = match bytes_to_write {
                     Some(bytes_to_write) => Some(
@@ -722,9 +708,9 @@ impl LiquidCache {
                     Some(write),
                 ))
             }
-            CacheEntry::DiskLiquid { .. } | CacheEntry::DiskArrow { .. } => {
-                unreachable!("Unexpected batch in write_in_memory_batch_to_disk")
-            }
+            // A disk record always installs, so an insert never comes back
+            // here with one; refused rather than asserted.
+            CacheEntry::DiskLiquid { .. } | CacheEntry::DiskArrow { .. } => Err(CacheFull),
         }
     }
 
@@ -837,7 +823,7 @@ impl LiquidCache {
         cache_policy: Box<dyn CachePolicy>,
         hydration_policy: Box<dyn HydrationPolicy>,
         metadata: Arc<dyn EntryMetadata>,
-        store: t4::Store,
+        store: DiskStore,
         evict_victims_concurrently: bool,
     ) -> Self {
         let config = CacheConfig::new(batch_size, max_memory_bytes, max_disk_bytes);
@@ -900,16 +886,26 @@ impl LiquidCache {
         // insert that raced the removal of its key, until a later insert that
         // grows the budget evicts.
         //
-        // A disk record holds no memory, so it installs however full the
-        // memory budget reads. Its write cannot then be dropped, taking its
-        // charge, while the caller retries the record.
+        // A disk record holds only its fixed metadata charge
+        // (`CacheEntry::DISK_RECORD_BYTES`), which is charged however full
+        // the memory budget reads, so the record always installs. Its write
+        // cannot then be dropped, taking its charge, while the caller retries
+        // the record. Usage can exceed the maximum by those charges only
+        // while records alone fill it, which a disk budget D allows only when
+        // the memory budget is below D / 16: every record also holds an
+        // extent of at least one 4 KiB page, so there are at most D / 4096 of
+        // them. Owners size the memory budget at or above that.
         let assumed_old_size = self
             .index
             .get(&entry_id)
             .map_or(0, |slot| slot.entry.memory_usage_bytes());
         let reserved = new_memory_size.saturating_sub(assumed_old_size);
-        if reserved > 0 && self.budget.try_reserve_memory(reserved).is_err() {
-            return Err(to_insert);
+        if reserved > 0 {
+            if write.is_some() {
+                self.budget.charge_memory(reserved);
+            } else if self.budget.try_reserve_memory(reserved).is_err() {
+                return Err(to_insert);
+            }
         }
         let unreserved = new_memory_size - reserved;
         if unreserved > 0 {
@@ -923,9 +919,7 @@ impl LiquidCache {
                 - self.budget.hold_if_snapshotted(&entry_id, &slot.entry)
         });
         if released > 0 {
-            self.budget
-                .try_update_memory_usage(released, 0)
-                .expect("memory release cannot fail");
+            self.budget.release_memory(released);
         }
         let displaced = displaced.and_then(|displaced| self.charge_of(&displaced.entry));
         let orphan = match write {
@@ -954,11 +948,12 @@ impl LiquidCache {
         Ok(orphan)
     }
 
-    /// The disk budget a record holds: its object's payload and trailer.
+    /// The disk budget a record holds: the extent its object takes, header
+    /// and padding included ([`DiskStore::footprint`]).
     fn charged_bytes(entry: &CacheEntry) -> Option<usize> {
         match entry {
             CacheEntry::DiskLiquid { disk_bytes, .. }
-            | CacheEntry::DiskArrow { disk_bytes, .. } => Some(disk_bytes + IDENTITY_TRAILER_LEN),
+            | CacheEntry::DiskArrow { disk_bytes, .. } => Some(DiskStore::footprint(*disk_bytes)),
             CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => None,
         }
     }
@@ -998,10 +993,7 @@ impl LiquidCache {
             .get(&entry_id)
             .is_some_and(|slot| Self::charged_bytes(&slot.entry).is_some());
         if !named {
-            self.store
-                .remove(&entry_id_to_key(&entry_id))
-                .await
-                .expect("disk remove failed");
+            self.store.remove(&entry_id);
         }
         unfinished.settled();
     }
@@ -1037,8 +1029,7 @@ impl LiquidCache {
         };
         let held = self.budget.hold_if_snapshotted(&entry_id, &removed.entry);
         self.budget
-            .try_update_memory_usage(removed.entry.memory_usage_bytes() - held, 0)
-            .expect("memory release cannot fail");
+            .release_memory(removed.entry.memory_usage_bytes() - held);
         self.cache_policy.notify_remove(&entry_id);
         // A write can have installed the key again, and told the policy,
         // between the removal and the notice above, which then took the new
@@ -1064,8 +1055,7 @@ impl LiquidCache {
         };
         let held = self.budget.hold_if_snapshotted(&entry_id, &removed.entry);
         self.budget
-            .try_update_memory_usage(removed.entry.memory_usage_bytes() - held, 0)
-            .expect("memory release cannot fail");
+            .release_memory(removed.entry.memory_usage_bytes() - held);
         self.cache_policy.notify_remove(&entry_id);
     }
 
@@ -1081,18 +1071,27 @@ impl LiquidCache {
     /// The removal and the delete hold the key's lock, so a write of the key
     /// that follows puts its object after the delete, not before it.
     async fn remove_disk_entry(&self, entry_id: EntryID) {
+        self.remove_disk_record(entry_id, None).await;
+    }
+
+    /// [`Self::remove_disk_entry`], of a record held for `owner` only when
+    /// one is given.
+    async fn remove_disk_record(&self, entry_id: EntryID, owner: Option<u64>) {
         let key_lock = self.disk_key_locks.lock(&entry_id).await;
-        let Some(removed) = self
-            .index
-            .remove_if(&entry_id, |slot| Self::charged_bytes(&slot.entry).is_some())
-        else {
+        let Some(removed) = self.index.remove_if(&entry_id, |slot| {
+            Self::charged_bytes(&slot.entry).is_some()
+                && owner.is_none_or(|identity| slot.belongs_to(identity))
+        }) else {
             return;
         };
         let disk_bytes = match &removed.entry {
             CacheEntry::DiskLiquid { disk_bytes, .. }
             | CacheEntry::DiskArrow { disk_bytes, .. } => *disk_bytes,
-            _ => unreachable!("remove_if removed a memory entry"),
+            CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => 0,
         };
+        // The record's own memory charge (`CacheEntry::DISK_RECORD_BYTES`).
+        self.budget
+            .release_memory(removed.entry.memory_usage_bytes());
         let charge = self.charge_of(&removed.entry);
         let unfinished = self.unfinished_object(entry_id);
         // Told while the key is still held: a spill of the key that follows
@@ -1101,10 +1100,7 @@ impl LiquidCache {
         // `notify_remove`; one that spills a key sharing this lock would wait
         // on itself.
         self.cache_policy.notify_remove(&entry_id);
-        self.store
-            .remove(&entry_id_to_key(&entry_id))
-            .await
-            .expect("disk remove failed");
+        self.store.remove(&entry_id);
         unfinished.settled();
         drop(key_lock);
         drop(charge);
@@ -1225,6 +1221,12 @@ impl LiquidCache {
                 }
                 EvictionOutcome::Remove => {
                     self.remove_disk_entry(victim).await;
+                    break;
+                }
+                // The policy found no form to keep the victim in: it leaves
+                // memory with nothing in its place, as a full disk would.
+                EvictionOutcome::Drop => {
+                    self.drop_memory_victim(victim, &observed);
                     break;
                 }
             }
@@ -1378,17 +1380,25 @@ impl LiquidCache {
                     None => Some(liquid.to_arrow_array()),
                 }
             }
-            _ => unreachable!("Unexpected batch in read_disk_array"),
+            // Called with disk records only.
+            CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => None,
         }
     }
 
-    /// Write `bytes` to disk for `identity`, followed by the identity itself.
+    /// Write `bytes` to disk as `entry_id`'s object for `identity`.
     ///
     /// Objects are keyed by entry id alone, so a write landing after the key
     /// changed hands can leave one identity's bytes where another's entry
-    /// points. The trailer is what lets a read notice that and miss. It sits
-    /// after the payload so the payload keeps the alignment it is read with.
-    /// The disk budget is charged for the trailer as well as the payload.
+    /// points. The store's header names the identity, so a read under the
+    /// other one misses. The disk budget is charged the extent the object
+    /// takes ([`DiskStore::footprint`]), not only its payload.
+    ///
+    /// A failed put is counted and refused like a full disk: the caller drops
+    /// the entry. The store then holds no new object for the key, and the key
+    /// is left to [`StrayObjects`], which deletes any older object no record
+    /// names. A put the store refuses for want of a long enough free extent
+    /// is such a failure too; evicting disk victims for it would take their
+    /// keys' locks while this key's is held.
     ///
     /// Returns the write for [`Self::try_insert`] to install the record
     /// naming the object with.
@@ -1401,12 +1411,9 @@ impl LiquidCache {
     ) -> Result<DiskWrite<'_>, CacheFull> {
         self.delete_strays().await;
         let len = bytes.len();
+        let charged = DiskStore::footprint(len);
         loop {
-            if self
-                .budget
-                .try_reserve_disk(len + IDENTITY_TRAILER_LEN)
-                .is_ok()
-            {
+            if self.budget.try_reserve_disk(charged).is_ok() {
                 break;
             }
             let victims = self.cache_policy.find_disk_victim(8);
@@ -1419,23 +1426,24 @@ impl LiquidCache {
         }
         let charge = DiskCharge {
             budget: &self.budget,
-            bytes: len + IDENTITY_TRAILER_LEN,
+            bytes: charged,
         };
         self.trace(InternalEvent::IoWrite {
             entry: entry_id,
             kind: CachedBatchType::from(batch),
             bytes: len,
         });
-        let mut object = Vec::with_capacity(len + IDENTITY_TRAILER_LEN);
-        object.extend_from_slice(&bytes);
-        object.extend_from_slice(&identity.to_le_bytes());
         // Taken only now: removing the victims above takes their keys' locks.
         let key_lock = self.disk_key_locks.lock(&entry_id).await;
         let unnamed = self.unfinished_object(entry_id);
-        self.store
-            .put(entry_id_to_key(&entry_id), object)
+        if let Err(error) = self
+            .store
+            .put(ObjectKey::new(entry_id, identity), bytes)
             .await
-            .expect("write failed");
+        {
+            self.observer.on_disk_write_failure(&error);
+            return Err(CacheFull);
+        }
         Ok(DiskWrite {
             key_lock,
             charge,
@@ -1444,34 +1452,64 @@ impl LiquidCache {
     }
 
     /// The payload stored under `entry_id`, if it was written for `identity`.
+    ///
+    /// The store returns bytes only when the object's header names this
+    /// entry and identity and its checksum matches. No object, or one another
+    /// identity wrote since the key changed hands, is a plain miss. An object
+    /// that cannot be read, or does not match its header, is a failure: it is
+    /// counted, and the record naming it dropped so no later read tries it.
     async fn read_disk_bytes(&self, entry_id: &EntryID, identity: u64) -> Option<Bytes> {
-        let mut object = match self.store.get(&entry_id_to_key(entry_id)).await {
-            Ok(object) => object,
-            Err(t4::Error::NotFound) => return None,
-            Err(error) => panic!("read failed: {error}"),
-        };
-        let payload_len = object.len().checked_sub(IDENTITY_TRAILER_LEN)?;
-        let trailer: [u8; IDENTITY_TRAILER_LEN] = object[payload_len..].try_into().unwrap();
-        if u64::from_le_bytes(trailer) != identity {
-            return None;
+        match self.store.get(ObjectKey::new(*entry_id, identity)).await {
+            Ok(payload) => Some(payload),
+            Err(DiskError::NotFound | DiskError::Foreign) => None,
+            Err(error) => {
+                self.observer.on_disk_read_failure(&error);
+                drop(error);
+                self.drop_unreadable(*entry_id, identity).await;
+                None
+            }
         }
-        object.truncate(payload_len);
-        Some(Bytes::from(object))
+    }
+
+    /// Drop the record `identity` holds for a disk object that failed to
+    /// read or decode, if it still holds one. The caller has counted the
+    /// failure.
+    async fn drop_unreadable(&self, entry_id: EntryID, identity: u64) {
+        self.remove_disk_record(entry_id, Some(identity)).await;
     }
 
     async fn read_disk_arrow_array(&self, entry_id: &EntryID, identity: u64) -> Option<ArrayRef> {
         let bytes = self.read_disk_bytes(entry_id, identity).await?;
         let bytes_len = bytes.len();
-        let cursor = std::io::Cursor::new(bytes);
-        let mut reader =
-            arrow::ipc::reader::StreamReader::try_new(cursor, None).expect("create reader failed");
-        let batch = reader.next().unwrap().expect("read batch failed");
-        let array = batch.column(0).clone();
+        let array = match Self::decode_arrow(bytes) {
+            Ok(array) => array,
+            Err(error) => {
+                self.observer.on_disk_read_failure(&error);
+                drop(error);
+                self.drop_unreadable(*entry_id, identity).await;
+                return None;
+            }
+        };
         self.trace(InternalEvent::IoReadArrow {
             entry: *entry_id,
             bytes: bytes_len,
         });
         Some(array)
+    }
+
+    /// The one column of the one batch an Arrow IPC stream written by
+    /// [`arrow_to_bytes`] holds.
+    fn decode_arrow(bytes: Bytes) -> Result<ArrayRef, ArrowError> {
+        let mut reader =
+            arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)?;
+        let batch = reader
+            .next()
+            .ok_or_else(|| ArrowError::IpcError("the stream holds no batch".to_string()))??;
+        batch
+            .columns()
+            .first()
+            .cloned()
+            .ok_or_else(|| ArrowError::IpcError("the batch holds no column".to_string()))
     }
 
     async fn read_disk_liquid_array(
@@ -1480,13 +1518,22 @@ impl LiquidCache {
         identity: u64,
     ) -> Option<crate::liquid_array::LiquidArrayRef> {
         let bytes = self.read_disk_bytes(entry_id, identity).await?;
-        self.trace(InternalEvent::IoReadLiquid {
-            entry: *entry_id,
-            bytes: bytes.len(),
-        });
-        Some(Arc::new(crate::liquid_array::LiquidArray::from_bytes(
-            bytes,
-        )))
+        let bytes_len = bytes.len();
+        match crate::liquid_array::LiquidArray::try_from_bytes(bytes) {
+            Ok(array) => {
+                self.trace(InternalEvent::IoReadLiquid {
+                    entry: *entry_id,
+                    bytes: bytes_len,
+                });
+                Some(Arc::new(array))
+            }
+            Err(error) => {
+                self.observer.on_disk_read_failure(&error);
+                drop(error);
+                self.drop_unreadable(*entry_id, identity).await;
+                None
+            }
+        }
     }
 
     pub(crate) async fn eval_predicate_internal(
@@ -1902,7 +1949,11 @@ mod tests {
     #[tokio::test]
     async fn missing_disk_blob_is_a_cache_miss() {
         let directory = tempfile::tempdir().unwrap();
-        let store = t4::mount(directory.path().join("cache.t4")).await.unwrap();
+        let store = DiskStore::mount(
+            directory.path().join("cache.disk"),
+            crate::cache::DiskOptions::default(),
+        )
+        .unwrap();
         let cache = LiquidCacheBuilder::new()
             .with_store(store.clone())
             .build()
@@ -1914,7 +1965,7 @@ mod tests {
             .await
             .unwrap();
         cache.flush_all_to_disk().await.unwrap();
-        store.remove(&entry_id_to_key(&id)).await.unwrap();
+        assert!(store.remove(&id));
 
         assert!(cache.get(&id, 0).await.is_none());
     }
@@ -2123,8 +2174,8 @@ mod tests {
     async fn insert_until_disk_full_then_evicts_oldest_disk_entry() {
         let first_array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
         let second_array: ArrayRef = Arc::new(Int32Array::from_iter_values(16..32));
-        let first_bytes = arrow_to_bytes(&first_array).unwrap().len() + IDENTITY_TRAILER_LEN;
-        let second_bytes = arrow_to_bytes(&second_array).unwrap().len() + IDENTITY_TRAILER_LEN;
+        let first_bytes = DiskStore::footprint(arrow_to_bytes(&first_array).unwrap().len());
+        let second_bytes = DiskStore::footprint(arrow_to_bytes(&second_array).unwrap().len());
         let cache = LiquidCacheBuilder::new()
             .with_max_memory_bytes(1 << 20)
             .with_max_disk_bytes(first_bytes.max(second_bytes))
@@ -2175,7 +2226,7 @@ mod tests {
     #[tokio::test]
     async fn disk_eviction_releases_budget() {
         let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
-        let disk_bytes = arrow_to_bytes(&array).unwrap().len() + IDENTITY_TRAILER_LEN;
+        let disk_bytes = DiskStore::footprint(arrow_to_bytes(&array).unwrap().len());
         let cache = LiquidCacheBuilder::new()
             .with_max_memory_bytes(1 << 20)
             .with_max_disk_bytes(disk_bytes)
@@ -2348,7 +2399,7 @@ mod tests {
         let flushed = EntryID::from(921usize);
         let hydrated_array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
         let flushed_array: ArrayRef = Arc::new(Int32Array::from_iter_values(16..32));
-        let disk_bytes = arrow_to_bytes(&hydrated_array).unwrap().len() + IDENTITY_TRAILER_LEN;
+        let disk_bytes = DiskStore::footprint(arrow_to_bytes(&hydrated_array).unwrap().len());
         let hook = Arc::new(std::sync::Mutex::new(None::<DiskVictimHook>));
         let cache = block_on(
             LiquidCacheBuilder::new()
@@ -2420,7 +2471,7 @@ mod tests {
     #[tokio::test]
     async fn hydrate_and_spill_cycles_hold_one_disk_copy() {
         let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..1024));
-        let one_copy = arrow_to_bytes(&array).unwrap().len() + IDENTITY_TRAILER_LEN;
+        let one_copy = DiskStore::footprint(arrow_to_bytes(&array).unwrap().len());
         let (cache, store, _directory) = cache_over_counted_store(1 << 20, 4 * one_copy).await;
         let entry = EntryID::from(930usize);
         cache.insert(entry, 0, array.clone()).await.unwrap();
@@ -2438,7 +2489,7 @@ mod tests {
                 charged_after_spill,
                 served: read.is_some(),
                 charged_after_read: cache.stats().disk_usage_bytes,
-                objects_after_read: store.len().await.unwrap(),
+                objects_after_read: store.len(),
             });
         }
 
@@ -2458,9 +2509,13 @@ mod tests {
     async fn cache_over_counted_store(
         max_memory_bytes: usize,
         max_disk_bytes: usize,
-    ) -> (Arc<LiquidCache>, t4::Store, tempfile::TempDir) {
+    ) -> (Arc<LiquidCache>, DiskStore, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
-        let store = t4::mount(directory.path().join("cache.t4")).await.unwrap();
+        let store = DiskStore::mount(
+            directory.path().join("cache.disk"),
+            crate::cache::DiskOptions::default(),
+        )
+        .unwrap();
         let cache = LiquidCacheBuilder::new()
             .with_max_memory_bytes(max_memory_bytes)
             .with_max_disk_bytes(max_disk_bytes)
@@ -2475,7 +2530,7 @@ mod tests {
 
     /// The disk budget charges exactly the disk records in the index, and the
     /// store holds exactly the objects they name, each still readable.
-    async fn assert_disk_matches_index(cache: &LiquidCache, store: &t4::Store) {
+    async fn assert_disk_matches_index(cache: &LiquidCache, store: &DiskStore) {
         let mut charged = 0;
         let mut named = Vec::new();
         cache.index().for_each(|entry_id, slot| {
@@ -2490,7 +2545,7 @@ mod tests {
             "disk charged for anything but the disk records"
         );
         assert_eq!(
-            store.len().await.unwrap(),
+            store.len(),
             named.len(),
             "the store holds objects no disk record names"
         );
@@ -2541,14 +2596,14 @@ mod tests {
 
     /// The disk an Arrow array's record is charged.
     fn arrow_copy(array: &ArrayRef) -> usize {
-        arrow_to_bytes(array).unwrap().len() + IDENTITY_TRAILER_LEN
+        DiskStore::footprint(arrow_to_bytes(array).unwrap().len())
     }
 
     /// A cache holding `array` under `entry` on disk, spilled by a flush.
     async fn flushed(
         entry: EntryID,
         array: &ArrayRef,
-    ) -> (Arc<LiquidCache>, t4::Store, tempfile::TempDir) {
+    ) -> (Arc<LiquidCache>, DiskStore, tempfile::TempDir) {
         let (cache, store, directory) = cache_over_counted_store(1 << 20, 1 << 20).await;
         cache.insert(entry, 0, array.clone()).await.unwrap();
         cache.flush_all_to_disk().await.unwrap();
@@ -2694,7 +2749,7 @@ mod tests {
         let Ok(Orphan(None)) = cache.try_insert(blocker, 0, record, Some(blocking)) else {
             panic!("a written disk record installs, and leaves no orphan");
         };
-        assert_eq!(store.len().await.unwrap(), 2, "the entry's object is left");
+        assert_eq!(store.len(), 2, "the entry's object is left");
 
         cache.insert(next, 0, array.clone()).await.unwrap();
         spill(&cache, next, &array).await;
@@ -2720,7 +2775,7 @@ mod tests {
             .unwrap();
         drop(write);
         assert_eq!(cache.budget.disk_usage_bytes(), 0);
-        assert_eq!(store.len().await.unwrap(), 1, "the put landed");
+        assert_eq!(store.len(), 1, "the put landed");
 
         cache.insert(next, 0, array.clone()).await.unwrap();
         spill(&cache, next, &array).await;
@@ -2870,9 +2925,13 @@ mod tests {
     /// A cache whose eviction policy is `policy`, over a counted store.
     async fn cache_keeping_disk_entries(
         policy: KeepDiskEntries,
-    ) -> (Arc<LiquidCache>, t4::Store, tempfile::TempDir) {
+    ) -> (Arc<LiquidCache>, DiskStore, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
-        let store = t4::mount(directory.path().join("cache.t4")).await.unwrap();
+        let store = DiskStore::mount(
+            directory.path().join("cache.disk"),
+            crate::cache::DiskOptions::default(),
+        )
+        .unwrap();
         let cache = LiquidCacheBuilder::new()
             .with_max_memory_bytes(1 << 20)
             .with_max_disk_bytes(1 << 20)
@@ -2968,9 +3027,13 @@ mod tests {
     }
 
     /// A cache over a counted store whose cache policy is `policy`.
-    fn cache_with_policy(policy: PanicOnce) -> (Arc<LiquidCache>, t4::Store, tempfile::TempDir) {
+    fn cache_with_policy(policy: PanicOnce) -> (Arc<LiquidCache>, DiskStore, tempfile::TempDir) {
         let directory = tempfile::tempdir().unwrap();
-        let store = block_on(t4::mount(directory.path().join("cache.t4"))).unwrap();
+        let store = DiskStore::mount(
+            directory.path().join("cache.disk"),
+            crate::cache::DiskOptions::default(),
+        )
+        .unwrap();
         let cache = block_on(
             LiquidCacheBuilder::new()
                 .with_max_memory_bytes(1 << 20)
@@ -3080,7 +3143,11 @@ mod tests {
         let entry = EntryID::from(943usize);
         let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
         let directory = tempfile::tempdir().unwrap();
-        let store = block_on(t4::mount(directory.path().join("cache.t4"))).unwrap();
+        let store = DiskStore::mount(
+            directory.path().join("cache.disk"),
+            crate::cache::DiskOptions::default(),
+        )
+        .unwrap();
         let hook = Arc::new(std::sync::Mutex::new(None::<DiskVictimHook>));
         let cache = block_on(
             LiquidCacheBuilder::new()

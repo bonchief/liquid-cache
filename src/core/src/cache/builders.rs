@@ -8,6 +8,7 @@ use arrow::buffer::BooleanBuffer;
 
 use super::cached_batch::CacheEntry;
 use super::core::LiquidCache;
+use super::disk::{DiskOptions, DiskStore};
 use super::io_context::{DefaultCacheMetadata, EntryMetadata};
 use super::policies::{CachePolicy, EvictionPolicy, HydrationPolicy, TranscodeEvict};
 use super::{CacheExpression, CacheFull, EntryID, LiquidExpr, LiquidPolicy};
@@ -37,7 +38,7 @@ pub struct LiquidCacheBuilder {
     hydration_policy: Box<dyn HydrationPolicy>,
     eviction_policy: Box<dyn EvictionPolicy>,
     metadata: Option<Arc<dyn EntryMetadata>>,
-    store: Option<t4::Store>,
+    store: Option<DiskStore>,
     evict_victims_concurrently: bool,
 }
 
@@ -114,9 +115,12 @@ impl LiquidCacheBuilder {
         self
     }
 
-    /// Set the [`t4::Store`] used for on-disk IO.
+    /// Set the [`DiskStore`] used for on-disk IO. Mount it with a capacity
+    /// of at least the max disk bytes: the budget charges each object its
+    /// [`DiskStore::footprint`], and a store with less room refuses writes
+    /// the budget allowed, which drops their entries.
     /// If not provided, the builder mounts a fresh store at a temporary directory.
-    pub fn with_store(mut self, store: t4::Store) -> Self {
+    pub fn with_store(mut self, store: DiskStore) -> Self {
         self.store = Some(store);
         self
     }
@@ -130,16 +134,28 @@ impl LiquidCacheBuilder {
     /// Build the cache storage.
     ///
     /// The cache storage is wrapped in an [Arc] to allow for concurrent access.
-    /// When no [`t4::Store`] is provided, one is mounted at a temporary directory.
+    /// When no [`DiskStore`] is provided, one as large as the max disk bytes
+    /// (at most 1 TiB) is mounted at a temporary directory.
+    ///
+    /// # Panics
+    ///
+    /// If no store was provided and none can be mounted there.
     pub async fn build(self) -> Arc<LiquidCache> {
         let store = match self.store {
             Some(store) => store,
             None => {
-                let cache_dir = tempfile::tempdir().unwrap().keep();
-                let store_path = cache_dir.join("liquid_cache.t4");
-                t4::mount(&store_path)
-                    .await
-                    .expect("failed to mount t4 store")
+                let cache_dir = tempfile::tempdir()
+                    .expect("failed to create the disk store's directory")
+                    .keep();
+                // An unbounded disk budget gets a file no filesystem refuses.
+                let capacity = u64::try_from(self.max_disk_bytes)
+                    .unwrap_or(u64::MAX)
+                    .min(1 << 40);
+                DiskStore::mount(
+                    cache_dir.join("liquid_cache.disk"),
+                    DiskOptions::new(capacity),
+                )
+                .expect("failed to mount the disk store")
             }
         };
         let metadata = self

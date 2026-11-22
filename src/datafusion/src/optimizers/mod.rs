@@ -734,7 +734,11 @@ mod tests {
         max_memory_bytes: usize,
         max_disk_bytes: usize,
     ) -> LiquidCacheParquetRef {
-        let store = t4::mount(path.join("liquid_cache.t4")).await.unwrap();
+        let store = liquid_cache::cache::DiskStore::mount(
+            path.join("liquid_cache.disk"),
+            liquid_cache::cache::DiskOptions::default(),
+        )
+        .unwrap();
         Arc::new(
             LiquidCacheParquet::new(
                 8192,
@@ -1507,7 +1511,7 @@ mod tests {
     }
 }
 
-/// Pure unit tests for the footprint byte-math (no cache / no t4 mount, so they
+/// Pure unit tests for the footprint byte-math (no cache / no disk store mount, so they
 /// run everywhere). These cover the fallback direction: a column with an
 /// `Absent` size (or a file with no stats) falls back to the whole-file size,
 /// while `Exact`/`Inexact` per-column sizes are counted.
@@ -1589,7 +1593,7 @@ mod footprint_tests {
     }
 }
 
-/// Pure unit tests for the admission threshold arithmetic (no cache / no t4
+/// Pure unit tests for the admission threshold arithmetic (no cache / no disk store
 /// mount, so they run everywhere).
 #[cfg(test)]
 mod threshold_tests {

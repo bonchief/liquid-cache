@@ -20,6 +20,10 @@ pub enum EvictionOutcome {
     },
     /// Remove an already-on-disk entry.
     Remove,
+    /// Drop a memory entry the policy cannot move to a cheaper form, such as
+    /// an array that does not serialise. The cache removes it, as it does a
+    /// victim the disk has no room for.
+    Drop,
 }
 
 /// Chooses the next representation for an entry under memory pressure.
@@ -59,13 +63,19 @@ impl EvictionPolicy for TranscodeEvict {
 
 fn persist(entry: &CacheEntry) -> EvictionOutcome {
     match entry {
-        CacheEntry::MemoryArrow(array) => {
-            let bytes = arrow_to_bytes(array).expect("failed to serialize Arrow array");
-            EvictionOutcome::Replace {
+        CacheEntry::MemoryArrow(array) => match arrow_to_bytes(array) {
+            Ok(bytes) => EvictionOutcome::Replace {
                 entry: CacheEntry::disk_arrow(array.data_type().clone(), bytes.len()),
                 bytes_to_write: Some(bytes),
+            },
+            Err(error) => {
+                log::warn!(
+                    "dropped a cached {} array that does not serialise: {error}",
+                    array.data_type()
+                );
+                EvictionOutcome::Drop
             }
-        }
+        },
         CacheEntry::MemoryLiquid(array) => {
             let bytes = Bytes::from(array.to_bytes());
             EvictionOutcome::Replace {

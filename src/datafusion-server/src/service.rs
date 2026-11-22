@@ -58,9 +58,11 @@ impl LiquidCacheServiceInner {
         let liquid_cache_dir = disk_cache_dir.join("liquid");
         std::fs::create_dir_all(&liquid_cache_dir).expect("Failed to create liquid cache dir");
 
-        let store = t4::mount(liquid_cache_dir.join("liquid_cache.t4"))
-            .await
-            .expect("Failed to mount t4 store");
+        let store = liquid_cache::cache::DiskStore::mount(
+            liquid_cache_dir.join("liquid_cache.disk"),
+            liquid_cache::cache::DiskOptions::default(),
+        )
+        .expect("Failed to mount the disk store");
         let liquid_cache = Arc::new(
             LiquidCacheParquet::new(
                 batch_size,

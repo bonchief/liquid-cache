@@ -61,8 +61,12 @@ fn main() {
         .cache_dir
         .clone()
         .unwrap_or_else(|| tempfile::tempdir().unwrap().keep());
-    let store_path = cache_dir.join("liquid_cache.t4");
-    let store = tokio_test::block_on(t4::mount(&store_path)).expect("failed to mount t4 store");
+    let store_path = cache_dir.join("liquid_cache.disk");
+    let store = liquid_cache::cache::DiskStore::mount(
+        &store_path,
+        liquid_cache::cache::DiskOptions::default(),
+    )
+    .expect("failed to mount the disk store");
     let eviction_policy: Box<dyn EvictionPolicy> = match args.mode {
         CacheMode::Arrow => Box::new(Evict),
         CacheMode::Liquid => Box::new(TranscodeEvict),

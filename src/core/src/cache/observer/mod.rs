@@ -7,6 +7,7 @@ pub use stats::{CacheStats, RuntimeStats, RuntimeStatsSnapshot};
 pub use tracer::CacheTracer;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use internal_tracing::EventTracer;
 pub(crate) use internal_tracing::InternalEvent;
@@ -18,6 +19,8 @@ pub struct Observer {
     runtime: RuntimeStatsInner,
     event_tracer: EventTracer,
     cache_tracer: CacheTracer,
+    /// Whether a disk failure has been logged; later ones are only counted.
+    disk_failure_logged: AtomicBool,
 }
 
 impl Default for Observer {
@@ -33,6 +36,7 @@ impl Observer {
             runtime: RuntimeStatsInner::default(),
             event_tracer: EventTracer::new(),
             cache_tracer: CacheTracer::new(),
+            disk_failure_logged: AtomicBool::new(false),
         }
     }
 
@@ -92,6 +96,30 @@ impl Observer {
     #[inline]
     pub(crate) fn on_budget_underflow(&self) {
         self.runtime.incr_budget_underflows();
+    }
+
+    /// A disk write failed and its entry was dropped.
+    pub(crate) fn on_disk_write_failure(&self, error: &dyn std::fmt::Display) {
+        self.runtime.incr_disk_write_failures();
+        self.log_disk_failure("write", error);
+    }
+
+    /// A disk read failed, or its bytes did not match or decode, and its
+    /// entry was dropped.
+    pub(crate) fn on_disk_read_failure(&self, error: &dyn std::fmt::Display) {
+        self.runtime.incr_disk_read_failures();
+        self.log_disk_failure("read", error);
+    }
+
+    /// Logged once, so a failing disk cannot flood the log; every failure is
+    /// counted in `disk_write_failures` or `disk_read_failures`.
+    fn log_disk_failure(&self, operation: &str, error: &dyn std::fmt::Display) {
+        if !self.disk_failure_logged.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "disk tier {operation} failed and its entry was dropped: {error}. Later \
+                 failures are counted in disk_write_failures and disk_read_failures."
+            );
+        }
     }
 
     pub(crate) fn record_internal(&self, event: InternalEvent) {

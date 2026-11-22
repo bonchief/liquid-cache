@@ -193,9 +193,16 @@ impl LiquidCacheLocalBuilder {
         config.options_mut().execution.parquet.skip_metadata = false;
         config.options_mut().execution.batch_size = ConfigNonZeroUsize::try_new(self.batch_size)?;
 
-        let store = t4::mount(self.cache_dir.join("liquid_cache.t4"))
-            .await
-            .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
+        let store = liquid_cache::cache::DiskStore::mount(
+            self.cache_dir.join("liquid_cache.disk"),
+            // An unbounded disk budget gets a file no filesystem refuses.
+            liquid_cache::cache::DiskOptions::new(
+                u64::try_from(self.max_disk_bytes)
+                    .unwrap_or(u64::MAX)
+                    .min(1 << 40),
+            ),
+        )
+        .map_err(|e| datafusion::error::DataFusionError::External(Box::new(e)))?;
         #[cfg(not(test))]
         let cache = LiquidCacheParquet::new(
             self.batch_size,

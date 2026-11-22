@@ -18,14 +18,16 @@ pub enum CacheEntry {
     DiskLiquid {
         /// Original Arrow data type.
         data_type: DataType,
-        /// Byte length of the persisted backing data.
+        /// Byte length of the persisted payload, without the store's header
+        /// and padding.
         disk_bytes: usize,
     },
     /// Cached batch on disk as Arrow array.
     DiskArrow {
         /// Original Arrow data type.
         data_type: DataType,
-        /// Byte length of the persisted backing data.
+        /// Byte length of the persisted payload, without the store's header
+        /// and padding.
         disk_bytes: usize,
     },
 }
@@ -57,12 +59,24 @@ impl CacheEntry {
         }
     }
 
-    /// Memory usage reported by the underlying representation.
+    /// The memory a disk record is charged: its index slot, its policy
+    /// record and its extent in the disk store, each a few dozen bytes, with
+    /// room for the maps' own overhead.
+    ///
+    /// A disk record holds no array, but a full disk tier holds millions of
+    /// them, so their metadata is charged to the memory budget like any
+    /// entry's memory and bounded by it. A memory entry's own record is not
+    /// charged separately: next to the batch of rows its array holds, it is
+    /// small.
+    pub const DISK_RECORD_BYTES: usize = 256;
+
+    /// The memory the cache charges the entry: its array's, or for a disk
+    /// record [`Self::DISK_RECORD_BYTES`].
     pub fn memory_usage_bytes(&self) -> usize {
         match self {
             Self::MemoryArrow(array) => array.get_array_memory_size(),
             Self::MemoryLiquid(array) => array.get_array_memory_size(),
-            Self::DiskLiquid { .. } | Self::DiskArrow { .. } => 0,
+            Self::DiskLiquid { .. } | Self::DiskArrow { .. } => Self::DISK_RECORD_BYTES,
         }
     }
 

@@ -59,7 +59,6 @@ fastrace = "0.7"
 fastrace-tonic = "0.2"
 congee = "0.4.1"
 insta = { version = "1.47.2", features = ["filters"] }
-t4 = { version = "0.1.9", default-features = false }
 vortex-array = { git = "https://github.com/bonchief/vortex", rev = "7f682fe77e7f541352e0f03014401e0c5c9e87b9", default-features = false }
 vortex-arrow = { git = "https://github.com/bonchief/vortex", rev = "7f682fe77e7f541352e0f03014401e0c5c9e87b9", default-features = false }
 vortex-btrblocks = { git = "https://github.com/bonchief/vortex", rev = "7f682fe77e7f541352e0f03014401e0c5c9e87b9", default-features = false }

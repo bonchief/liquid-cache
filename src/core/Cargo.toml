@@ -23,7 +23,8 @@ arrow-schema = { workspace = true }
 ahash = { workspace = true }
 tempfile = { workspace = true }
 congee = { workspace = true }
-t4 = { workspace = true }
+libc = "0.2.191"
+twox-hash = { version = "2.1.4", default-features = false, features = ["std", "xxhash3_64"] }
 log = { workspace = true }
 parquet = { workspace = true }
 fastrace = { workspace = true }
@@ -62,7 +63,7 @@ insta = { workspace = true }
 datafusion = { workspace = true }
 
 [features]
-shuttle = ["t4/shuttle"]
+shuttle = []
 
 [[bench]]
 name = "cache_storage"

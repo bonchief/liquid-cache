@@ -9,7 +9,7 @@ use crate::sync::{Arc, RwLock};
 ///
 /// This trait covers only the metadata side of the cache: where to find a
 /// batch's compressor and lineage expressions. All actual byte IO goes through the
-/// [`t4::Store`] held by the cache itself.
+/// [`crate::cache::DiskStore`] held by the cache itself.
 pub trait EntryMetadata: Debug + Send + Sync {
     /// Add a lineage expression for an entry.
     fn add_lineage(&self, _entry_id: &EntryID, _expression: Arc<CacheExpression>) {
@@ -23,11 +23,6 @@ pub trait EntryMetadata: Debug + Send + Sync {
     fn lineage(&self, _entry_id: &EntryID) -> Option<Arc<CacheExpression>> {
         None
     }
-}
-
-/// Convert an [`EntryID`] to a t4 key (8-byte little-endian representation).
-pub(crate) fn entry_id_to_key(entry_id: &EntryID) -> Vec<u8> {
-    usize::from(*entry_id).to_le_bytes().to_vec()
 }
 
 /// A default implementation of [`EntryMetadata`].

@@ -416,8 +416,7 @@ impl LiquidCacheReaderInner {
         if self.projection_columns.is_empty() {
             let options = RecordBatchOptions::new().with_row_count(Some(selected_rows));
             let batch =
-                RecordBatch::try_new_with_options(self.schema.clone(), Vec::new(), &options)
-                    .unwrap();
+                RecordBatch::try_new_with_options(self.schema.clone(), Vec::new(), &options)?;
             return Ok(Some(batch));
         }
 
@@ -648,9 +647,11 @@ mod tests {
             [0],
         );
 
-        let store = t4::mount(tmp_dir.path().join("liquid_cache.t4"))
-            .await
-            .unwrap();
+        let store = liquid_cache::cache::DiskStore::mount(
+            tmp_dir.path().join("liquid_cache.disk"),
+            liquid_cache::cache::DiskOptions::default(),
+        )
+        .unwrap();
         let cache = LiquidCacheParquet::new(
             batch_size,
             usize::MAX,

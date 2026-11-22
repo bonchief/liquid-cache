@@ -1182,7 +1182,11 @@ mod tests {
         max_disk_bytes: usize,
         batch_size: usize,
     ) -> Arc<LiquidCacheParquet> {
-        let store = t4::mount(path.join("liquid_cache.t4")).await.unwrap();
+        let store = liquid_cache::cache::DiskStore::mount(
+            path.join("liquid_cache.disk"),
+            liquid_cache::cache::DiskOptions::default(),
+        )
+        .unwrap();
         Arc::new(
             LiquidCacheParquet::new(
                 batch_size,

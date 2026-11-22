@@ -104,6 +104,8 @@ define_runtime_stats! {
     (disk_reservation_failures, "Number of failed disk budget reservations.", incr_disk_reservation_failures),
     (budget_underflows, "Number of budget releases larger than the usage they came off, which stop at zero.", incr_budget_underflows),
     (eval_predicate_on_liquid_failed, "Number of `eval_predicate` calls that failed on Liquid array.", incr_eval_predicate_on_liquid_failed),
+    (disk_write_failures, "Number of disk writes that failed, whose entry was dropped.", incr_disk_write_failures),
+    (disk_read_failures, "Number of disk reads that failed, found an object not matching its header, or could not decode it; each entry was dropped.", incr_disk_read_failures),
 }
 
 /// Snapshot of cache statistics.

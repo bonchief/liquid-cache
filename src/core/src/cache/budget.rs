@@ -215,7 +215,8 @@ impl BudgetAccounting {
         }
     }
 
-    fn release_memory(&self, bytes: usize) {
+    /// Give back `bytes` of memory an entry held, stopping at zero.
+    pub(super) fn release_memory(&self, bytes: usize) {
         if let Some(charged) = release(&self.used_memory_bytes, bytes) {
             self.report_underflow("memory", bytes, charged);
         }
