@@ -368,13 +368,23 @@ fn pushdown_columns(
 /// predicate `Expr`.
 ///
 /// This value represents the total amount of IO required to evaluate the
-/// predicate.
+/// predicate. `columns` are root columns, indices into the file's Arrow
+/// schema; a nested one is several leaf column chunks, all of which are
+/// read, so every leaf under each root is summed, never the leaf that
+/// happens to share the root's index.
 fn size_of_columns(columns: &[usize], metadata: &ParquetMetaData) -> Result<usize> {
-    let mut total_size = 0;
-    let row_groups = metadata.row_groups();
-    for idx in columns {
-        for rg in row_groups.iter() {
-            total_size += rg.column(*idx).compressed_size() as usize;
+    let schema = metadata.file_metadata().schema_descr();
+    let leaves: Vec<usize> = (0..schema.num_columns())
+        .filter(|leaf| columns.contains(&schema.get_column_root_idx(*leaf)))
+        .collect();
+    let mut total_size = 0usize;
+    for rg in metadata.row_groups() {
+        for leaf in &leaves {
+            let size = rg
+                .columns()
+                .get(*leaf)
+                .map_or(0, |chunk| usize::try_from(chunk.compressed_size()).unwrap_or(0));
+            total_size = total_size.saturating_add(size);
         }
     }
 
