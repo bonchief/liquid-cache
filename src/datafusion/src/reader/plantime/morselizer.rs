@@ -48,8 +48,8 @@ use crate::{
     reader::{
         plantime::row_filter::build_row_filter,
         runtime::{
-            LiquidRowGroupPlanner, apply_predicates, build_projection_schema, get_root_column_ids,
-            take_next_batch,
+            LiquidRowGroupPlanner, OnMiss, apply_predicates, build_projection_schema,
+            get_root_column_ids, take_next_batch,
         },
     },
     utils::row_selector_to_boolean_buffer,
@@ -73,6 +73,8 @@ pub(crate) struct LiquidMorselizer {
     pub(crate) span: Option<Arc<fastrace::Span>>,
     pub(crate) lineages: Arc<ColumnLineages>,
     pub(crate) prefetch: bool,
+    /// Whether a miss inserts what it reads from Parquet.
+    pub(crate) fill: bool,
 }
 
 type ParquetInput = Box<dyn AsyncFileReader>;
@@ -193,6 +195,7 @@ impl Morselizer for LiquidMorselizer {
                 span,
                 lineages: Arc::clone(&self.lineages),
                 prefetch: self.prefetch,
+                fill: self.fill,
             })),
         }))
     }
@@ -204,6 +207,9 @@ pub(crate) struct LiquidFileMetrics {
     pub(crate) predicate_creation_errors: Count,
     pub(crate) batches_prefetched: Count,
     pub(crate) prefetch_skipped: Count,
+    /// Batches a read with fill off found missing and read from Parquet
+    /// without inserting.
+    pub(crate) tier_raced_batches: Count,
 }
 
 impl LiquidFileMetrics {
@@ -220,6 +226,8 @@ impl LiquidFileMetrics {
                 .counter("batches_prefetched", partition_index),
             prefetch_skipped: MetricBuilder::new(metrics)
                 .counter("prefetch_skipped", partition_index),
+            tier_raced_batches: MetricBuilder::new(metrics)
+                .counter("tier_raced_batches", partition_index),
         }
     }
 }
@@ -243,6 +251,7 @@ struct PreparedLiquidOpen {
     span: Option<Arc<fastrace::Span>>,
     lineages: Arc<ColumnLineages>,
     prefetch: bool,
+    fill: bool,
 }
 
 struct MetadataLoadedLiquidOpen {
@@ -623,6 +632,14 @@ fn plan_row_group_morsels(planned: PlannedRowGroups) -> Result<Option<MorselPlan
         .projection
         .try_map_exprs(|expr| reassign_expr_columns(expr, &stream_schema))?;
     let projector = Arc::new(projection.make_projector(&stream_schema)?);
+    let on_miss = if context.prepared.fill {
+        OnMiss::Fill
+    } else {
+        OnMiss::Race {
+            raced: context.prepared.metrics.tier_raced_batches.clone(),
+            cache: Arc::clone(&context.prepared.liquid_cache),
+        }
+    };
     let row_group_planner = Arc::new(LiquidRowGroupPlanner {
         metadata: Arc::clone(&metadata),
         reader_factory: context.prepared.reader_factory,
@@ -636,6 +653,7 @@ fn plan_row_group_morsels(planned: PlannedRowGroups) -> Result<Option<MorselPlan
         span: context.prepared.span,
         liquid_cache: context.prepared.liquid_cache,
         metrics: context.prepared.metrics.clone(),
+        on_miss,
     });
 
     let row_group_indexes = access_plan.row_group_indexes();
@@ -709,10 +727,9 @@ impl LiquidRowGroupChain {
 
 impl MorselPlanner for LiquidRowGroupChain {
     fn plan(mut self: Box<Self>) -> Result<Option<MorselPlan>> {
-        let (row_group_idx, selection) = self
-            .queue
-            .pop_front()
-            .expect("a row group chain is never empty");
+        let Some((row_group_idx, selection)) = self.queue.pop_front() else {
+            return Ok(None);
+        };
         let snapshots = std::mem::take(&mut self.snapshots);
         let Some(morsel) = self.planner.plan(row_group_idx, Some(selection), snapshots) else {
             return internal_err!("selected row group {row_group_idx} produced no morsel");
@@ -741,7 +758,12 @@ async fn prefetch_future(chain: LiquidRowGroupChain) -> Result<Box<dyn MorselPla
 }
 
 async fn prefetch_front(chain: LiquidRowGroupChain) -> LiquidRowGroupChain {
-    let (row_group_idx, selection) = chain.queue.front().expect("prefetch chain has work");
+    let Some((row_group_idx, selection)) = chain.queue.front() else {
+        return chain;
+    };
+    // A prefetch that finds a batch missing fills it; with fill off it stops
+    // there and leaves the batch to the read, which inserts nothing.
+    let fills = matches!(chain.planner.on_miss, OnMiss::Fill);
     let mut selectors: VecDeque<_> = selection.clone().into();
     let batch_size = chain.planner.cached_file.batch_size();
     let selected_batches = std::iter::from_fn(|| take_next_batch(&mut selectors, batch_size))
@@ -768,6 +790,9 @@ async fn prefetch_front(chain: LiquidRowGroupChain) -> LiquidRowGroupChain {
         .await;
         produced_snapshots |= predicate_summary.any_snapshotted;
 
+        if predicate_summary.any_missing && !fills {
+            break;
+        }
         if predicate_summary.any_missing {
             match materialize_prefetch_batch(&mut context, batch_id).await {
                 Ok(true) => produced_snapshots = true,
@@ -807,6 +832,9 @@ async fn prefetch_front(chain: LiquidRowGroupChain) -> LiquidRowGroupChain {
                 )
                 .await;
                 produced_snapshots |= projection_summary.any_snapshotted;
+                if projection_summary.any_missing && !fills {
+                    break;
+                }
                 if projection_summary.any_missing {
                     match materialize_prefetch_batch(&mut context, batch_id).await {
                         Ok(true) => produced_snapshots = true,
@@ -854,7 +882,10 @@ async fn prefetch_columns(
         any_snapshotted: false,
     };
     for column_id in column_ids {
-        let column = row_group.get_column(*column_id as u64).unwrap();
+        let Some(column) = row_group.get_column(*column_id as u64) else {
+            summary.any_missing = true;
+            continue;
+        };
         match column.prefetch_snapshot(batch_id).await {
             PrefetchOutcome::Snapshotted => summary.any_snapshotted = true,
             PrefetchOutcome::Missing => summary.any_missing = true,
@@ -874,11 +905,12 @@ async fn materialize_prefetch_batch(
 ) -> std::result::Result<bool, parquet::errors::ParquetError> {
     let record_batch = context.fallback.fetch_batch(batch_id).await?;
     for (position, column_id) in context.cache_column_ids.iter().enumerate() {
-        let column = context
-            .cached_row_group
-            .get_column(*column_id as u64)
-            .unwrap();
-        let array = Arc::clone(record_batch.column(position));
+        let (Some(column), Some(array)) = (
+            context.cached_row_group.get_column(*column_id as u64),
+            record_batch.columns().get(position).cloned(),
+        ) else {
+            return Ok(false);
+        };
         match column.insert(batch_id, Arc::clone(&array)).await {
             Ok(()) | Err(InsertArrowArrayError::AlreadyCached) => {
                 column.prefetch_snapshot(batch_id).await;
@@ -1262,6 +1294,7 @@ mod tests {
             span: None,
             lineages: Arc::default(),
             prefetch: options.prefetch,
+            fill: true,
         };
         let cached_file = cache.register_or_get_file(
             ParquetFileIdentity::new(object_store_url, file_name),
@@ -1408,6 +1441,7 @@ mod tests {
             span: None,
             lineages: Arc::default(),
             prefetch: true,
+            fill: true,
         };
         let morselizer_b = LiquidMorselizer {
             partition_index: 0,
@@ -1427,6 +1461,7 @@ mod tests {
             span: None,
             lineages: Arc::default(),
             prefetch: true,
+            fill: true,
         };
 
         let file_a = PartitionedFile::new("data.parquet", std::fs::metadata(path_a).unwrap().len());

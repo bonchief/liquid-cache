@@ -21,7 +21,8 @@ use crate::{
 
 use super::{
     liquid_cache_reader::{
-        LiquidCacheReader, LiquidCacheReaderConfig, ParquetFallback, ParquetFallbackConfig,
+        LiquidCacheReader, LiquidCacheReaderConfig, OnMiss, ParquetFallback,
+        ParquetFallbackConfig,
     },
     utils::get_root_column_ids,
 };
@@ -39,6 +40,7 @@ pub(crate) struct LiquidRowGroupPlanner {
     pub(crate) span: Option<Arc<fastrace::Span>>,
     pub(crate) liquid_cache: LiquidCacheParquetRef,
     pub(crate) metrics: LiquidFileMetrics,
+    pub(crate) on_miss: OnMiss,
 }
 
 impl LiquidRowGroupPlanner {
@@ -157,6 +159,7 @@ impl LiquidRowGroupPlanner {
 
         Some(LiquidRowGroupMorsel {
             config: LiquidCacheReaderConfig {
+                on_miss: self.on_miss.clone(),
                 selection,
                 row_filter: self.row_filter.clone(),
                 cached_row_group,

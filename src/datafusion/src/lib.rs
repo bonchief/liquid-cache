@@ -12,7 +12,9 @@ pub use cache::{LiquidCacheParquet, LiquidCacheParquetRef};
 pub use liquid_cache as storage;
 pub use liquid_cache_common as common;
 pub use reader::variant_udf::{VariantGetUdf, VariantPretty, VariantToJsonUdf};
-pub use reader::{FilterCandidateBuilder, LiquidParquetSource, LiquidPredicate, LiquidRowFilter};
+pub use reader::{
+    FilterCandidateBuilder, Held, LiquidParquetSource, LiquidPredicate, LiquidRowFilter,
+};
 pub use utils::{boolean_buffer_and_then, extract_execution_metrics};
 
 /// Register the variant functions used by LiquidCache in a query session.

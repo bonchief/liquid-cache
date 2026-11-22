@@ -1,4 +1,4 @@
-pub use source::LiquidParquetSource;
+pub use source::{Held, LiquidParquetSource};
 
 mod morselizer;
 mod row_filter;

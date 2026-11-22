@@ -16,7 +16,8 @@ use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaData;
 
-use crate::cache::{BatchID, CachedRowGroupRef, InsertArrowArrayError};
+use crate::cache::{BatchID, CachedRowGroupRef, InsertArrowArrayError, LiquidCacheParquetRef};
+use datafusion::physical_plan::metrics::Count;
 use crate::reader::plantime::{LiquidFileReaderFactory, LiquidRowFilter};
 use crate::reader::runtime::utils::take_next_batch;
 use crate::utils::{boolean_buffer_and_then, row_selector_to_boolean_buffer};
@@ -55,9 +56,24 @@ struct LiquidCacheReaderInner {
     projection_columns: Vec<usize>,
     parquet_fallback: ParquetFallback,
     last_pull: Option<(BatchID, RecordBatch)>,
+    on_miss: OnMiss,
+}
+
+/// What a read does with a batch it found missing and read from Parquet.
+#[derive(Clone)]
+pub(crate) enum OnMiss {
+    /// Insert it into the cache.
+    Fill,
+    /// Keep it for this read alone and count it as raced: **a read never
+    /// inserts when fill is off**.
+    Race {
+        raced: Count,
+        cache: LiquidCacheParquetRef,
+    },
 }
 
 pub(crate) struct LiquidCacheReaderConfig {
+    pub(crate) on_miss: OnMiss,
     pub(crate) selection: RowSelection,
     pub(crate) row_filter: Option<LiquidRowFilter>,
     pub(crate) cached_row_group: CachedRowGroupRef,
@@ -111,6 +127,7 @@ impl LiquidCacheReader {
             config.projection_columns,
             Arc::clone(&config.schema),
             ParquetFallback::new(config.parquet_fallback),
+            config.on_miss,
         );
         Self {
             state: ReaderState::Ready(Box::new(inner)),
@@ -188,7 +205,11 @@ impl ParquetFallback {
             self.rebuild_stream(batch_id)?;
         }
 
-        let stream = self.stream.as_mut().expect("fallback stream is present");
+        let Some(stream) = self.stream.as_mut() else {
+            return Err(ParquetError::General(
+                "parquet fallback has no stream".to_string(),
+            ));
+        };
         let record_batch = stream.next().await.transpose()?.ok_or_else(|| {
             ParquetError::General(format!(
                 "parquet fallback ended before batch {}",
@@ -260,6 +281,7 @@ impl LiquidCacheReaderInner {
         projection_columns: Vec<usize>,
         schema: SchemaRef,
         parquet_fallback: ParquetFallback,
+        on_miss: OnMiss,
     ) -> Self {
         Self {
             cached_row_group,
@@ -270,6 +292,7 @@ impl LiquidCacheReaderInner {
             projection_columns,
             parquet_fallback,
             last_pull: None,
+            on_miss,
         }
     }
 
@@ -449,9 +472,7 @@ impl LiquidCacheReaderInner {
             arrays.push(array);
         }
 
-        Ok(Some(
-            RecordBatch::try_new(self.schema.clone(), arrays).unwrap(),
-        ))
+        Ok(Some(RecordBatch::try_new(self.schema.clone(), arrays)?))
     }
 
     async fn read_parquet_batch_and_fill_cache(
@@ -485,14 +506,27 @@ impl LiquidCacheReaderInner {
                         "column {file_column_id} not present in liquid cache"
                     ))
                 })?;
-            let array = Arc::clone(record_batch.column(col_idx));
+            let Some(array) = record_batch.columns().get(col_idx).cloned() else {
+                return Err(ArrowError::ComputeError(format!(
+                    "parquet fallback returned no column {col_idx}"
+                )));
+            };
 
-            match column.insert(batch_id, Arc::clone(&array)).await {
-                Ok(()) | Err(InsertArrowArrayError::AlreadyCached) => {}
-                Err(InsertArrowArrayError::CacheFull) => {
-                    column.insert_snapshot(batch_id, array);
-                }
+            match &self.on_miss {
+                OnMiss::Fill => match column.insert(batch_id, Arc::clone(&array)).await {
+                    Ok(()) | Err(InsertArrowArrayError::AlreadyCached) => {}
+                    Err(InsertArrowArrayError::CacheFull) => {
+                        column.insert_snapshot(batch_id, array);
+                    }
+                },
+                // Held for this read only, so the predicates and the
+                // projection read it like any other batch of the run.
+                OnMiss::Race { .. } => column.insert_snapshot(batch_id, array),
             }
+        }
+        if let OnMiss::Race { raced, cache } = &self.on_miss {
+            raced.add(1);
+            cache.count_raced(1);
         }
 
         self.last_pull = Some((batch_id, record_batch.clone()));
@@ -515,7 +549,11 @@ impl LiquidCacheReaderInner {
                 ))
             })?;
 
-        Ok(Arc::clone(record_batch.column(position)))
+        record_batch.columns().get(position).cloned().ok_or_else(|| {
+            ArrowError::ComputeError(format!(
+                "parquet fallback returned no column {position}"
+            ))
+        })
     }
 }
 
@@ -602,6 +640,7 @@ mod tests {
     impl TestRowGroup {
         fn reader(&self, request: ReaderRequest) -> LiquidCacheReader {
             LiquidCacheReader::new(LiquidCacheReaderConfig {
+                on_miss: OnMiss::Fill,
                 selection: request.selection,
                 row_filter: request.row_filter,
                 cached_row_group: Arc::clone(&self.row_group),

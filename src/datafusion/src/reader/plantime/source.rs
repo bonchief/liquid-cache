@@ -23,16 +23,33 @@ use datafusion::{
     },
 };
 use datafusion_datasource::PartitionedFile;
-use datafusion_datasource::morsel::Morselizer;
+use datafusion_datasource::morsel::{MorselPlanner, Morselizer};
 use object_store::ObjectStore;
 use std::{
     fmt::{self, Formatter},
     sync::Arc,
 };
 
-/// The data source for LiquidCache
+/// Marks a file part as held: every row group its access plan reads is in
+/// the cache whole, for every column the scan reads. Whoever decides that
+/// (from [`LiquidCacheParquet::holds_all`](crate::cache::LiquidCacheParquet::holds_all))
+/// inserts it into the part's [`PartitionedFile::extensions`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Held;
+
+/// The data source for LiquidCache.
+///
+/// **A part without [`Held`] is read by the stock Parquet path.** The source
+/// keeps the `ParquetSource` it was made from and applies every setting and
+/// pushdown to it as well as to itself, so either path reads a part the way
+/// the plan asked. Only a part marked [`Held`] goes through the cache reader.
 #[derive(Clone)]
 pub struct LiquidParquetSource {
+    /// The stock source, configured like this one, for parts not held.
+    inner: ParquetSource,
+    /// Whether a read that misses in a held row group inserts what it reads
+    /// from Parquet. Off, a miss reads Parquet and inserts nothing.
+    fill: bool,
     metrics: ExecutionPlanMetricsSet,
     predicate: Option<Arc<dyn PhysicalExpr>>,
     table_parquet_options: TableParquetOptions,
@@ -95,15 +112,35 @@ impl LiquidParquetSource {
         &self.lineages
     }
 
+    /// Whether a read that misses inserts what it reads from Parquet.
+    /// Default on. **A read never inserts when fill is off**: a miss in a
+    /// held row group reads Parquet, serves the rows and leaves the cache as
+    /// it was, counted as raced.
+    pub fn with_fill(mut self, fill: bool) -> Self {
+        self.fill = fill;
+        self
+    }
+
     /// Set predicate information.
     pub fn with_predicate(mut self, predicate: Arc<dyn PhysicalExpr>) -> Self {
+        self.inner = self.inner.with_predicate(Arc::clone(&predicate));
         self.predicate = Some(predicate);
         self
+    }
+
+    /// `source`, a stock source this one derived, as a `ParquetSource`, or
+    /// the current one if the stock source answered with another type.
+    fn stock(&self, source: &Arc<dyn FileSource>) -> ParquetSource {
+        source
+            .downcast_ref::<ParquetSource>()
+            .cloned()
+            .unwrap_or_else(|| self.inner.clone())
     }
 
     /// Create a new LiquidParquetSource from a ParquetSource
     pub fn from_parquet_source(source: ParquetSource, liquid_cache: LiquidCacheParquetRef) -> Self {
         let predicate = source.filter();
+        let inner = source.clone();
         let parquet_file_reader_factory = source.parquet_file_reader_factory().cloned();
 
         let table_schema = source.table_schema().clone();
@@ -115,6 +152,8 @@ impl LiquidParquetSource {
             )
         });
         let mut v = Self {
+            inner,
+            fill: true,
             table_schema,
             table_parquet_options: source.table_parquet_options().clone(),
             batch_size: Some(liquid_cache.batch_size()),
@@ -238,6 +277,16 @@ impl FileSource for LiquidParquetSource {
             .clone()
             .unwrap_or_else(|| Arc::new(DefaultPhysicalExprAdapterFactory) as _);
 
+        let Some(batch_size) = self.batch_size else {
+            return internal_err!("LiquidParquetSource has no batch size set");
+        };
+        // The stock reader takes this source's batch size, however it was
+        // set, so it never meets an unset one.
+        let plain = self.inner.with_batch_size(batch_size).create_morselizer(
+            Arc::clone(&object_store),
+            base_config,
+            partition,
+        )?;
         let parquet_file_reader_factory = self
             .parquet_file_reader_factory
             .clone()
@@ -247,12 +296,10 @@ impl FileSource for LiquidParquetSource {
             .span
             .clone()
             .map(|span| fastrace::Span::enter_with_parent(format!("opener_{partition}"), &span));
-        Ok(Box::new(LiquidMorselizer {
+        let liquid = Box::new(LiquidMorselizer {
             partition_index: partition,
             projection: self.projection.clone(),
-            batch_size: self
-                .batch_size
-                .expect("Batch size must be set before creating LiquidMorselizer"),
+            batch_size,
             predicate: self.predicate.clone(),
             table_schema: self.table_schema.clone(),
             metrics: self.metrics.clone(),
@@ -265,12 +312,15 @@ impl FileSource for LiquidParquetSource {
             span: execution_span.map(Arc::new),
             lineages: Arc::clone(&self.lineages),
             prefetch: self.prefetch,
-        }))
+            fill: self.fill,
+        });
+        Ok(Box::new(DispatchMorselizer { liquid, plain }))
     }
 
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
         let mut conf = self.clone();
         conf.batch_size = Some(batch_size);
+        conf.inner = self.stock(&self.inner.with_batch_size(batch_size));
         Arc::new(conf)
     }
 
@@ -286,8 +336,14 @@ impl FileSource for LiquidParquetSource {
         &self,
         projection: &ProjectionExprs,
     ) -> Result<Option<Arc<dyn FileSource>>> {
+        // A projection the stock source cannot take is declined for both,
+        // so a part read either way yields the same columns.
+        let Some(inner) = self.inner.try_pushdown_projection(projection)? else {
+            return Ok(None);
+        };
         let mut source = self.clone();
         source.projection = self.projection.try_merge(projection)?;
+        source.inner = self.stock(&inner);
         Ok(Some(Arc::new(source)))
     }
 
@@ -318,11 +374,24 @@ impl FileSource for LiquidParquetSource {
         }
     }
 
+    /// A filter is reported pushed down only when both paths apply it to
+    /// every row: this reader, and the stock source with its row filter on.
+    /// Either path may still apply one reported not pushed, which the parent
+    /// then applies again.
     fn try_pushdown_filters(
         &self,
         filters: Vec<Arc<dyn PhysicalExpr>>,
-        _config: &ConfigOptions,
+        config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn FileSource>>> {
+        let stock = self
+            .inner
+            .clone()
+            .with_pushdown_filters(true)
+            .try_pushdown_filters(filters.clone(), config)?;
+        let inner = match &stock.updated_node {
+            Some(node) => self.stock(node),
+            None => self.inner.clone(),
+        };
         let filters: Vec<_> = filters
             .into_iter()
             .map(|filter| {
@@ -338,9 +407,12 @@ impl FileSource for LiquidParquetSource {
             .iter()
             .all(|filter| matches!(filter.discriminant, PushedDown::No))
         {
+            let mut source = self.clone();
+            source.inner = inner;
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
                 vec![PushedDown::No; filters.len()],
-            ));
+            )
+            .with_updated_node(Arc::new(source) as Arc<dyn FileSource>));
         }
 
         let supported = filters
@@ -350,12 +422,24 @@ impl FileSource for LiquidParquetSource {
                 PushedDown::No => None,
             });
         let predicate = conjunction(self.predicate.iter().cloned().chain(supported));
-        let source = Arc::new(self.clone().with_predicate(predicate));
+        let mut source = self.clone();
+        source.predicate = Some(predicate);
+        source.inner = inner;
+        let pushed = filters
+            .iter()
+            .enumerate()
+            .map(|(index, filter)| {
+                match (filter.discriminant, stock.filters.get(index).copied()) {
+                    (PushedDown::Yes, Some(PushedDown::Yes)) => PushedDown::Yes,
+                    _ => PushedDown::No,
+                }
+            })
+            .collect();
 
-        Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-            filters.iter().map(|filter| filter.discriminant).collect(),
+        Ok(
+            FilterPushdownPropagation::with_parent_pushdown_result(pushed)
+                .with_updated_node(Arc::new(source) as Arc<dyn FileSource>),
         )
-        .with_updated_node(source))
     }
 
     /// Approximate a sort for a parent TopK by ordering the files it reads.
@@ -408,6 +492,14 @@ impl FileSource for LiquidParquetSource {
         }
         let mut source = self.clone();
         source.sort_order_for_reorder = Some(sort_order);
+        // The stock source approximates the same request its own way, for
+        // the parts it reads; the parent sort stays either way.
+        match self.inner.try_pushdown_sort(order, eq_properties)? {
+            SortOrderPushdownResult::Exact { inner } | SortOrderPushdownResult::Inexact { inner } => {
+                source.inner = self.stock(&inner);
+            }
+            SortOrderPushdownResult::Unsupported => {}
+        }
         Ok(SortOrderPushdownResult::Inexact {
             inner: Arc::new(source) as Arc<dyn FileSource>,
         })
@@ -431,6 +523,30 @@ impl FileSource for LiquidParquetSource {
                 .chain(self.projection.iter().map(|projection| &projection.expr)),
             f,
         )
+    }
+}
+
+/// Sends each part to the reader that serves it: a part marked [`Held`] to
+/// the cache reader, every other part to the stock Parquet reader, with its
+/// access plan as given.
+struct DispatchMorselizer {
+    liquid: Box<LiquidMorselizer>,
+    plain: Box<dyn Morselizer>,
+}
+
+impl fmt::Debug for DispatchMorselizer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DispatchMorselizer").finish_non_exhaustive()
+    }
+}
+
+impl Morselizer for DispatchMorselizer {
+    fn plan_file(&self, file: PartitionedFile) -> Result<Box<dyn MorselPlanner>> {
+        if file.extensions.contains::<Held>() {
+            self.liquid.plan_file(file)
+        } else {
+            self.plain.plan_file(file)
+        }
     }
 }
 

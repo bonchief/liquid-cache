@@ -693,6 +693,13 @@ fn convert_parquet_scan(
 
     let mut new_config = file_scan_config.clone();
     new_config.file_source = Arc::new(new_source);
+    // This optimizer runs the cache reader on every part it converts, as it
+    // did before the stock path existed: each one is marked held.
+    for group in &mut new_config.file_groups {
+        for index in 0..group.len() {
+            group[index].extensions.insert(crate::reader::Held);
+        }
+    }
     let new_file_source: Arc<dyn DataSource> = Arc::new(new_config);
     Some(Arc::new(DataSourceExec::new(new_file_source)))
 }
