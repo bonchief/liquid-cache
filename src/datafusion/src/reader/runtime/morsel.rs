@@ -21,8 +21,7 @@ use crate::{
 
 use super::{
     liquid_cache_reader::{
-        LiquidCacheReader, LiquidCacheReaderConfig, OnMiss, ParquetFallback,
-        ParquetFallbackConfig,
+        LiquidCacheReader, LiquidCacheReaderConfig, OnMiss, ParquetFallback, ParquetFallbackConfig,
     },
     utils::get_root_column_ids,
 };

@@ -288,9 +288,9 @@ impl<'a> Insert<'a> {
         // A slot to transcode in the background, taken now: without one the
         // array stays Arrow and nothing waits on it.
         let slot = text.and_then(|transcodes| {
-                let taken = Arc::clone(&transcodes.taken).try_acquire_owned().ok()?;
-                Some((taken, Arc::clone(&transcodes.running)))
-            });
+            let taken = Arc::clone(&transcodes.taken).try_acquire_owned().ok()?;
+            Some((taken, Arc::clone(&transcodes.running)))
+        });
         self.storage
             .insert_inner(
                 self.entry_id,

@@ -380,10 +380,9 @@ fn size_of_columns(columns: &[usize], metadata: &ParquetMetaData) -> Result<usiz
     let mut total_size = 0usize;
     for rg in metadata.row_groups() {
         for leaf in &leaves {
-            let size = rg
-                .columns()
-                .get(*leaf)
-                .map_or(0, |chunk| usize::try_from(chunk.compressed_size()).unwrap_or(0));
+            let size = rg.columns().get(*leaf).map_or(0, |chunk| {
+                usize::try_from(chunk.compressed_size()).unwrap_or(0)
+            });
             total_size = total_size.saturating_add(size);
         }
     }

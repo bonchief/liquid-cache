@@ -17,10 +17,10 @@ use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaData;
 
 use crate::cache::{BatchID, CachedRowGroupRef, InsertArrowArrayError, LiquidCacheParquetRef};
-use datafusion::physical_plan::metrics::Count;
 use crate::reader::plantime::{LiquidFileReaderFactory, LiquidRowFilter};
 use crate::reader::runtime::utils::take_next_batch;
 use crate::utils::{boolean_buffer_and_then, row_selector_to_boolean_buffer};
+use datafusion::physical_plan::metrics::Count;
 
 pub(crate) struct LiquidCacheReader {
     state: ReaderState,
@@ -549,11 +549,13 @@ impl LiquidCacheReaderInner {
                 ))
             })?;
 
-        record_batch.columns().get(position).cloned().ok_or_else(|| {
-            ArrowError::ComputeError(format!(
-                "parquet fallback returned no column {position}"
-            ))
-        })
+        record_batch
+            .columns()
+            .get(position)
+            .cloned()
+            .ok_or_else(|| {
+                ArrowError::ComputeError(format!("parquet fallback returned no column {position}"))
+            })
     }
 }
 

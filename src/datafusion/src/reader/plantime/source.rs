@@ -409,9 +409,10 @@ impl FileSource for LiquidParquetSource {
         {
             let mut source = self.clone();
             source.inner = inner;
-            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
-                vec![PushedDown::No; filters.len()],
-            )
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(vec![
+                PushedDown::No;
+                filters.len()
+            ])
             .with_updated_node(Arc::new(source) as Arc<dyn FileSource>));
         }
 
@@ -428,12 +429,12 @@ impl FileSource for LiquidParquetSource {
         let pushed = filters
             .iter()
             .enumerate()
-            .map(|(index, filter)| {
-                match (filter.discriminant, stock.filters.get(index).copied()) {
+            .map(
+                |(index, filter)| match (filter.discriminant, stock.filters.get(index).copied()) {
                     (PushedDown::Yes, Some(PushedDown::Yes)) => PushedDown::Yes,
                     _ => PushedDown::No,
-                }
-            })
+                },
+            )
             .collect();
 
         Ok(
@@ -495,7 +496,8 @@ impl FileSource for LiquidParquetSource {
         // The stock source approximates the same request its own way, for
         // the parts it reads; the parent sort stays either way.
         match self.inner.try_pushdown_sort(order, eq_properties)? {
-            SortOrderPushdownResult::Exact { inner } | SortOrderPushdownResult::Inexact { inner } => {
+            SortOrderPushdownResult::Exact { inner }
+            | SortOrderPushdownResult::Inexact { inner } => {
                 source.inner = self.stock(&inner);
             }
             SortOrderPushdownResult::Unsupported => {}

@@ -668,7 +668,9 @@ impl LiquidCache {
     /// back.
     pub async fn shrink(&self, bytes: usize) {
         while self.budget.memory_usage_bytes() > bytes {
-            let victims = self.cache_policy.find_memory_victim(Self::MAX_MEMORY_VICTIMS);
+            let victims = self
+                .cache_policy
+                .find_memory_victim(Self::MAX_MEMORY_VICTIMS);
             if victims.is_empty() {
                 break;
             }
@@ -1389,7 +1391,10 @@ impl LiquidCache {
                 return;
             }
         }
-        if victims.iter().any(|victim| matches!(victim.step, Step::Drop)) {
+        if victims
+            .iter()
+            .any(|victim| matches!(victim.step, Step::Drop))
+        {
             self.drop_chunk(&victims);
             return;
         }
@@ -1515,9 +1520,10 @@ impl LiquidCache {
         let Some(identity) = identity else {
             return;
         };
-        if victims.iter().any(|victim| {
-            matches!(victim.step, Step::Spill { .. }) && victim.identity != identity
-        }) {
+        if victims
+            .iter()
+            .any(|victim| matches!(victim.step, Step::Spill { .. }) && victim.identity != identity)
+        {
             self.drop_chunk(&victims);
             return;
         }
@@ -1957,7 +1963,9 @@ impl LiquidCache {
     pub async fn promote(&self, entries: &[EntryID], identity: u64) -> usize {
         let mut promoted = 0;
         for members in self.by_chunk(entries.to_vec()) {
-            let Some(first) = members.iter().find(|entry| self.is_on_disk(entry, identity))
+            let Some(first) = members
+                .iter()
+                .find(|entry| self.is_on_disk(entry, identity))
             else {
                 continue;
             };
@@ -1996,7 +2004,8 @@ impl LiquidCache {
     /// transcodes to something smaller, else Arrow with its view buffers
     /// compacted.
     pub fn encode(array: &ArrayRef) -> CacheEntry {
-        let arrow = super::builders::maybe_gc_view_arrays(array).unwrap_or_else(|| Arc::clone(array));
+        let arrow =
+            super::builders::maybe_gc_view_arrays(array).unwrap_or_else(|| Arc::clone(array));
         match crate::liquid_array::LiquidArray::from_arrow_array(&arrow) {
             Ok(liquid) if liquid.get_array_memory_size() < arrow.get_array_memory_size() => {
                 CacheEntry::memory_liquid(Arc::new(liquid))

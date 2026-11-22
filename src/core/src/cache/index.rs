@@ -102,9 +102,8 @@ impl Holdings {
     /// The bytes `entry` counts: its memory, or a disk record's disk share.
     fn bytes_of(entry: &CacheEntry) -> usize {
         match entry {
-            CacheEntry::DiskLiquid { disk_bytes, .. } | CacheEntry::DiskArrow { disk_bytes, .. } => {
-                *disk_bytes
-            }
+            CacheEntry::DiskLiquid { disk_bytes, .. }
+            | CacheEntry::DiskArrow { disk_bytes, .. } => *disk_bytes,
             CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => entry.memory_usage_bytes(),
         }
     }

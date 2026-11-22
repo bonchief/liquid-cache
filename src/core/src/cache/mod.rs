@@ -24,8 +24,8 @@ pub use observer::EventTrace;
 pub use observer::Observer;
 pub use observer::{CacheStats, RuntimeStats, RuntimeStatsSnapshot};
 pub use policies::{
-    AlwaysHydrate, CachePolicy, ChunkCounts, Evict, EvictionPolicy, HydrationPolicy, HydrationRequest,
-    LiquidPolicy, MaterializedEntry, NoHydration, TranscodeEvict,
+    AlwaysHydrate, CachePolicy, ChunkCounts, Evict, EvictionPolicy, HydrationPolicy,
+    HydrationRequest, LiquidPolicy, MaterializedEntry, NoHydration, TranscodeEvict,
 };
 pub use utils::EntryID;
 

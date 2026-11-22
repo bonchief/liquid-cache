@@ -55,7 +55,11 @@ impl std::error::Error for FillError {}
 /// several column chunks, one per leaf, and the span covers all of them.
 /// `None` when the metadata has no such chunk or its offsets are negative or
 /// overflow.
-pub fn chunk_span(metadata: &ParquetMetaData, row_group: usize, column: usize) -> Option<Range<u64>> {
+pub fn chunk_span(
+    metadata: &ParquetMetaData,
+    row_group: usize,
+    column: usize,
+) -> Option<Range<u64>> {
     let group = metadata.row_groups().get(row_group)?;
     let schema = metadata.file_metadata().schema_descr();
     let mut span: Option<Range<u64>> = None;
