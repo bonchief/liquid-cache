@@ -356,3 +356,31 @@ async fn a_record_naming_another_identity_s_object_is_dropped() {
     );
     assert_eq!(store.mismatches(), 0);
 }
+
+#[tokio::test]
+async fn a_batch_tagged_another_form_than_its_record_is_refused() {
+    use crate::cache::{ObjectKey, StoredBatch};
+    let directory = tempfile::tempdir().unwrap();
+    let store = DiskStore::mount(
+        directory.path().join("tier.disk"),
+        DiskOptions::new(1 << 20),
+    )
+    .unwrap();
+    let cache = cache(1 << 30, Some(store.clone())).await;
+    insert_chunk(&cache, 1).await;
+    cache.insert(entry(2, 0), 0, array(20)).await.unwrap();
+    assert_eq!(tiers(&cache, 1), vec![Some(true); BATCHES]);
+
+    // The records say Arrow; the object now tags its batches Liquid.
+    let liquid = (0..BATCHES)
+        .map(|batch| StoredBatch::new(entry(1, batch), 1, bytes::Bytes::from_static(b"liquid")))
+        .collect();
+    store
+        .put_chunk(ObjectKey::new(entry(1, 0), 0), liquid)
+        .await
+        .unwrap();
+
+    assert!(cache.get(&entry(1, 0), 0).read().await.is_none());
+    assert_eq!(cache.stats().runtime.disk_read_failures, 1);
+    assert!(!cache.contains(&entry(1, 0), 0));
+}

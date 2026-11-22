@@ -1914,9 +1914,19 @@ impl LiquidCache {
     /// it dropped so no later read tries it. The batch is copied out of the
     /// chunk's buffer, so an array decoded from it and kept in memory is
     /// charged for what it holds and pins no other batch's bytes.
-    async fn read_disk_bytes(&self, entry_id: &EntryID, identity: u64) -> Option<Bytes> {
+    ///
+    /// The object's directory tags each batch with its form. A batch tagged
+    /// other than `form`, the form the record says, is a fault like a bad
+    /// header: counted, its record dropped, and a miss.
+    async fn read_disk_bytes(&self, entry_id: &EntryID, identity: u64, form: u8) -> Option<Bytes> {
         let (object, _charge) = self.read_object(entry_id, identity).await?;
-        let (_, bytes) = object.batch(entry_id)?;
+        let (tagged, bytes) = object.batch(entry_id)?;
+        if tagged != form {
+            let error = format!("the disk object tags the batch {tagged}, its record {form}");
+            self.observer.on_disk_read_failure(&error);
+            self.drop_unreadable(*entry_id, identity).await;
+            return None;
+        }
         Some(Bytes::copy_from_slice(&bytes))
     }
 
@@ -2152,7 +2162,7 @@ impl LiquidCache {
     }
 
     async fn read_disk_arrow_array(&self, entry_id: &EntryID, identity: u64) -> Option<ArrayRef> {
-        let bytes = self.read_disk_bytes(entry_id, identity).await?;
+        let bytes = self.read_disk_bytes(entry_id, identity, FORM_ARROW).await?;
         let bytes_len = bytes.len();
         let array = match Self::decode_arrow(bytes) {
             Ok(array) => array,
@@ -2190,7 +2200,9 @@ impl LiquidCache {
         entry_id: &EntryID,
         identity: u64,
     ) -> Option<crate::liquid_array::LiquidArrayRef> {
-        let bytes = self.read_disk_bytes(entry_id, identity).await?;
+        let bytes = self
+            .read_disk_bytes(entry_id, identity, FORM_LIQUID)
+            .await?;
         let bytes_len = bytes.len();
         match crate::liquid_array::LiquidArray::try_from_bytes(bytes) {
             Ok(array) => {
@@ -3225,7 +3237,7 @@ mod tests {
         );
         for (entry_id, identity) in named {
             assert!(
-                cache.read_disk_bytes(&entry_id, identity).await.is_some(),
+                cache.read_object(&entry_id, identity).await.is_some(),
                 "the disk record for {entry_id:?} names an object that is gone"
             );
         }
