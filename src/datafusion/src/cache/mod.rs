@@ -621,6 +621,16 @@ impl LiquidCacheParquet {
         }
     }
 
+    /// The file registry. One process serves every query, so a panic on
+    /// another thread while it held the lock is not passed on to each later
+    /// caller: the lock is taken back with the registry as that thread left
+    /// it.
+    fn files(&self) -> crate::sync::MutexGuard<'_, FileRegistry> {
+        self.files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Register a file in the cache.
     pub fn register_or_get_file(
         &self,
@@ -638,7 +648,7 @@ impl LiquidCacheParquet {
         full_file_schema: SchemaRef,
         lineages: Arc<ColumnLineages>,
     ) -> CachedFileRef {
-        let mut files = self.files.lock().unwrap();
+        let mut files = self.files();
         let (key, lease, new) = files.register(file_identity);
         let sweep = new && files.should_sweep();
         drop(files);
@@ -665,7 +675,7 @@ impl LiquidCacheParquet {
         column: u64,
         rows: usize,
     ) -> bool {
-        let Some(key) = self.files.lock().unwrap().key(file) else {
+        let Some(key) = self.files().key(file) else {
             return false;
         };
         let path = ColumnAccessPath::new(key.slot as u64, row_group, column);
@@ -686,7 +696,7 @@ impl LiquidCacheParquet {
         row_groups: &[(u64, usize)],
         columns: &[u64],
     ) -> Vec<bool> {
-        let Some(key) = self.files.lock().unwrap().key(file) else {
+        let Some(key) = self.files().key(file) else {
             return vec![false; row_groups.len()];
         };
         let batches = |rows: usize| rows.div_ceil(self.batch_size());
@@ -793,7 +803,7 @@ impl LiquidCacheParquet {
         column: u64,
         rows: usize,
     ) -> usize {
-        let Some(key) = self.files.lock().unwrap().key(file) else {
+        let Some(key) = self.files().key(file) else {
             return 0;
         };
         let entries = self.held_entries(file, row_group, column, rows);
@@ -827,7 +837,7 @@ impl LiquidCacheParquet {
         column: u64,
         rows: usize,
     ) -> Vec<EntryID> {
-        let Some(key) = self.files.lock().unwrap().key(file) else {
+        let Some(key) = self.files().key(file) else {
             return Vec::new();
         };
         let path = ColumnAccessPath::new(key.slot as u64, row_group, column);
@@ -861,13 +871,13 @@ impl LiquidCacheParquet {
             return 0;
         }
         let _sweeping = Sweeping(&self.sweeping);
-        let idle = self.files.lock().unwrap().idle_files();
+        let idle = self.files().idle_files();
         let mut occupied = ahash::AHashSet::new();
         if !idle.is_empty() {
             self.cache_store
                 .for_each_entry_identity(|identity| _ = occupied.insert(identity));
         }
-        let mut files = self.files.lock().unwrap();
+        let mut files = self.files();
         let (forgotten, freed) = files.forget(&idle, &occupied);
         // Before a freed slot can be handed out again.
         self.metadata.forget_files(&freed);
@@ -879,7 +889,7 @@ impl LiquidCacheParquet {
     /// holding cached data, plus any not yet forgotten by
     /// [`Self::reclaim_idle_files`].
     pub fn leased_file_ids(&self) -> usize {
-        self.files.lock().unwrap().len()
+        self.files().len()
     }
 
     /// How many registrations so far found every value of the cache key's
@@ -890,7 +900,7 @@ impl LiquidCacheParquet {
     /// 65,536, and steadily when more than that are being read or holding
     /// cached data at once.
     pub fn file_ids_over_key_width(&self) -> u64 {
-        self.files.lock().unwrap().over_key_width()
+        self.files().over_key_width()
     }
 
     /// How many cache lookups found a key held by another file, and missed
@@ -945,7 +955,7 @@ impl LiquidCacheParquet {
     /// This is unsafe because resetting the cache while other threads are using the cache may cause undefined behavior.
     /// You should only call this when no one else is using the cache.
     pub unsafe fn reset(&self) {
-        let mut files = self.files.lock().unwrap();
+        let mut files = self.files();
         files.clear();
         self.metadata.clear();
         self.cache_store.reset();
