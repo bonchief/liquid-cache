@@ -15,9 +15,10 @@
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
-use arrow_schema::Fields;
+use arrow_schema::DataType;
 
 use super::ParquetFileIdentity;
+use crate::sync::Mutex;
 
 /// Registrations at which the first sweep for forgettable files runs, and
 /// the fewest registrations between two sweeps.
@@ -26,10 +27,10 @@ const MIN_SWEEP_AT: usize = 1024;
 /// How many distinct values the cache key's 16-bit file field holds.
 const SLOTS: usize = 1 << 16;
 
-/// The identity of a handle whose decoded schema is not the one its file's
-/// entries were cached under (see [`FileRegistry::decodes_as`]). Never handed
-/// out to a registration, so nothing is cached under it: such a handle is
-/// served nothing and inserts nothing.
+/// The identity of a column handle that decodes its column to another type
+/// than the one the file's entries of that column hold (see
+/// [`FileLease::decodes`]). Never handed out to a registration, so nothing is
+/// cached under it: such a column is served nothing and inserts nothing.
 pub(crate) const FOREIGN: u64 = u64::MAX;
 
 /// Where a registered file's entries live.
@@ -43,12 +44,52 @@ pub(crate) struct FileKey {
 
 /// Held by every handle that can read or write a file's entries. The registry
 /// holds one more; a file whose lease the registry alone holds has no handle.
+/// It carries the Arrow type each of the file's columns is decoded to.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct FileLease(Arc<()>);
+pub(crate) struct FileLease(Arc<Decodings>);
+
+/// Per column of one registration, by its index in the file's Arrow schema,
+/// the type its entries are decoded to.
+#[derive(Debug, Default)]
+struct Decodings(Mutex<AHashMap<u64, DataType>>);
 
 impl FileLease {
     fn is_idle(&self) -> bool {
         Arc::strong_count(&self.0) == 1
+    }
+
+    /// Per column of `columns` (its index in the file's Arrow schema and the
+    /// type a handle decodes it to), whether that handle reads and writes
+    /// the column's entries.
+    ///
+    /// **A column's entries hold one decoding**, pinned by the first handle
+    /// that uses the column: a row group handle that reads it, or a fill of
+    /// it. A later handle that decodes it to the same type shares every
+    /// entry, whatever other columns its scan reads or how it types them; one
+    /// that decodes it to another type (views against plain strings, say) is
+    /// refused for that column alone, so a read is never served an array of
+    /// a type it did not decode to. Two scans of one file with different
+    /// projections differ only in the columns one of them does not read, and
+    /// those it never pins or compares.
+    pub(crate) fn decodes<'a>(
+        &self,
+        columns: impl IntoIterator<Item = (u64, &'a DataType)>,
+    ) -> Vec<bool> {
+        let mut pinned = self
+            .0
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        columns
+            .into_iter()
+            .map(|(column, data_type)| match pinned.get(&column) {
+                Some(held) => held == data_type,
+                None => {
+                    pinned.insert(column, data_type.clone());
+                    true
+                }
+            })
+            .collect()
     }
 }
 
@@ -59,9 +100,6 @@ struct RegisteredFile {
     /// Bumped on every registration, so a sweep can tell that a handle was
     /// created (and possibly dropped again) while it scanned the cache.
     registrations: u64,
-    /// The Arrow fields the file's entries are decoded to: those of its
-    /// first registration.
-    fields: Option<Fields>,
 }
 
 /// A file a sweep may forget, as it was when the sweep started.
@@ -129,29 +167,9 @@ impl FileRegistry {
                 key,
                 lease: lease.clone(),
                 registrations: 0,
-                fields: None,
             },
         );
         (key, lease, true)
-    }
-
-    /// Whether a handle decoding `identity` to `fields` reads the entries
-    /// cached for it. **A file's entries hold one decoding**: the first
-    /// registration pins the fields, and a later one with other fields
-    /// (another type for a column, say views against plain strings) is
-    /// refused, so a read never gets an array of a type it did not decode
-    /// to. An unregistered file is refused too.
-    pub(crate) fn decodes_as(&mut self, identity: &ParquetFileIdentity, fields: &Fields) -> bool {
-        let Some(file) = self.files.get_mut(identity) else {
-            return false;
-        };
-        match &file.fields {
-            Some(pinned) => pinned == fields,
-            None => {
-                file.fields = Some(fields.clone());
-                true
-            }
-        }
     }
 
     /// Where `identity`'s entries live, if it is registered.
@@ -269,6 +287,25 @@ mod tests {
         let (other, _lease3, _) = registry.register(identity("b"));
         assert_ne!(other.slot, first.slot);
         assert_ne!(other.identity, first.identity);
+    }
+
+    #[test]
+    fn a_column_keeps_the_type_its_first_user_decoded_it_to() {
+        let mut registry = FileRegistry::default();
+        let (_, lease, _) = registry.register(identity("a"));
+        let view = DataType::Utf8View;
+        let plain = DataType::Utf8;
+        assert_eq!(
+            lease.decodes([(0, &view), (1, &DataType::Int32)]),
+            [true, true]
+        );
+        // Another handle of the file: column 2 is new to it, column 0 differs.
+        let (_, again, _) = registry.register(identity("a"));
+        assert_eq!(
+            again.decodes([(0, &plain), (1, &DataType::Int32), (2, &plain)]),
+            [false, true, true]
+        );
+        assert_eq!(again.decodes([(0, &view), (2, &plain)]), [true, true]);
     }
 
     #[test]

@@ -33,8 +33,9 @@ pub enum FillError {
     Arrow(ArrowError),
     /// The cache refused the chunk; none of it was kept.
     Full,
-    /// The file's entries are cached decoded to other types than `schema`
-    /// decodes it to: a read registered it first with another table schema.
+    /// The column's entries are cached decoded to another type than `schema`
+    /// decodes it to: a scan that types that column otherwise used it first.
+    /// Only that column is refused; the file's other columns fill as usual.
     Schema,
 }
 
@@ -48,7 +49,7 @@ impl std::fmt::Display for FillError {
             Self::Full => write!(out, "the cache has no room for the column chunk"),
             Self::Schema => write!(
                 out,
-                "the file is cached decoded to other types than this fill's schema"
+                "the column is cached decoded to another type than this fill's schema"
             ),
         }
     }

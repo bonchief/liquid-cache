@@ -290,14 +290,29 @@ impl CachedRowGroup {
         snapshots: Arc<RowGroupSnapshots>,
     ) -> Self {
         let mut column_maps = ColumnMaps::default();
-        for (column_id, field, expression, is_predicate_column) in columns {
+        // Each column is served its file's entries only where it decodes to
+        // the type they hold ([`FileLease::decodes`]); one that does not is
+        // foreign alone, and the row group's other columns are still served.
+        let decodes = lease.decodes(
+            columns
+                .iter()
+                .map(|(column_id, field, _, _)| (*column_id, field.data_type())),
+        );
+        for ((column_id, field, expression, is_predicate_column), decodes) in
+            columns.iter().zip(decodes)
+        {
             let column_access_path =
                 ColumnAccessPath::new(file.slot as u64, row_group_idx, *column_id);
+            let identity = if decodes {
+                file.identity
+            } else {
+                registry::FOREIGN
+            };
             let column = Arc::new(CachedColumn::new(
                 Arc::clone(field),
                 Arc::clone(&cache_store),
                 column_access_path,
-                file.identity,
+                identity,
                 lease.clone(),
                 expression.clone(),
                 *is_predicate_column,
@@ -501,7 +516,21 @@ impl CachedFile {
         }
     }
 
-    /// Create a row group handle scoped to the current query context.
+    /// A row group handle for `columns` alone (their indices in the file
+    /// schema), as a read of only those columns makes it: it uses, and so
+    /// pins the decoding of, those columns and no other.
+    pub fn create_row_group_of(&self, row_group_id: u64, columns: &[usize]) -> CachedRowGroupRef {
+        self.create_row_group_with_snapshots(
+            row_group_id,
+            Vec::new(),
+            Some(columns),
+            Arc::default(),
+        )
+    }
+
+    /// Create a row group handle scoped to the current query context, over
+    /// every column of the handle's schema: it uses, and so pins the
+    /// decoding of, all of them ([`Self::create_row_group_of`] uses some).
     pub fn create_row_group(
         &self,
         row_group_id: u64,
@@ -730,9 +759,14 @@ impl LiquidCacheParquet {
     /// Register a file in the cache, attaching typed lineage expressions derived from
     /// the query plan (keyed by file-schema column name).
     ///
-    /// The file's entries hold the decoding its first registration names
-    /// in `full_file_schema`. A handle registered with other fields is
-    /// served none of them and inserts none: its reads miss and fall back.
+    /// `full_file_schema` is how this handle decodes the file: the file's own
+    /// Arrow schema coerced to the scan's table, so it differs between scans
+    /// in the columns one of them does not read. It is compared per column,
+    /// never whole: each column's entries hold the type the first handle to
+    /// use that column decoded it to, and a handle that decodes a column
+    /// otherwise is served none of that column's entries and inserts none
+    /// (the registry's `FileLease::decodes`); its reads of it miss and fall
+    /// back, and its other columns are served.
     pub fn register_or_get_file_with_hints(
         &self,
         file_identity: ParquetFileIdentity,
@@ -740,10 +774,7 @@ impl LiquidCacheParquet {
         lineages: Arc<ColumnLineages>,
     ) -> CachedFileRef {
         let mut files = self.files();
-        let (mut key, lease, new) = files.register(file_identity.clone());
-        if !files.decodes_as(&file_identity, full_file_schema.fields()) {
-            key.identity = registry::FOREIGN;
-        }
+        let (key, lease, new) = files.register(file_identity);
         let sweep = new && files.should_sweep();
         drop(files);
         let file = Arc::new(CachedFile::new(
@@ -904,9 +935,18 @@ impl LiquidCacheParquet {
             return Err(FillError::NoSuchChunk);
         }
         // Registered under the schema a read registers it under, and held for
-        // the fill, so the file's slot is not handed on while it inserts.
+        // the fill, so the file's slot is not handed on while it inserts. The
+        // chunk goes in only where its column's entries hold the type this
+        // fill decodes it to, or none yet; the file's other columns are not
+        // compared.
+        let data_type = reader
+            .schema()
+            .fields()
+            .get(column)
+            .map(|field| field.data_type().clone())
+            .ok_or(FillError::NoSuchChunk)?;
         let cached = self.register_or_get_file(file.clone(), Arc::clone(reader.schema()));
-        if cached.key.identity == registry::FOREIGN {
+        if cached.lease.decodes([(col, &data_type)]) != [true] {
             return Err(FillError::Schema);
         }
         if self.holds_all(&file, &[(rg, rows)], &[col]) == [true] {
@@ -2013,31 +2053,47 @@ mod fill_tests {
     }
 
     #[tokio::test]
-    async fn a_file_cached_under_one_decoding_serves_no_other() {
+    async fn a_column_cached_under_one_decoding_serves_no_other() {
         let dir = tempfile::tempdir().unwrap();
         let cache = cache(dir.path()).await;
         let (bytes, metadata) = file();
-        // A read registered the file decoding `a` as Int64.
+        // A scan typing `a` as Int64 read it first.
         let other = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int64, false),
             Field::new("b", DataType::Int32, false),
         ]));
         let read = cache.register_or_get_file(identity(), Arc::clone(&other));
-        assert_ne!(read.key.identity, registry::FOREIGN);
+        let group = read.create_row_group(0, vec![]);
         let filled = fill(&cache, &metadata, 0, 0, chunk(&bytes, &metadata, 0, 0)).await;
         assert!(matches!(filled, Err(FillError::Schema)), "{filled:?}");
         assert_eq!(cache.storage().stats().total_entries, 0);
-        drop(read);
-
-        // Filled first: a read decoding otherwise is served nothing and
-        // inserts nothing.
-        let dir = tempfile::tempdir().unwrap();
-        let cache = self::cache(dir.path()).await;
-        fill(&cache, &metadata, 0, 0, chunk(&bytes, &metadata, 0, 0))
+        // `b` decodes alike in both: it fills, and that read is served it.
+        fill(&cache, &metadata, 0, 1, chunk(&bytes, &metadata, 0, 1))
             .await
             .unwrap();
+        assert_eq!(cache.storage().stats().total_entries, ROWS / BATCH);
+        assert!(group.get_column(1).unwrap().contains(BatchID::from_raw(0)));
+        drop((group, read));
+
+        // Filled first: a read decoding `a` otherwise is served none of `a`
+        // and inserts none, and is still served `b`.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = self::cache(dir.path()).await;
+        for column in 0..2 {
+            fill(
+                &cache,
+                &metadata,
+                0,
+                column,
+                chunk(&bytes, &metadata, 0, column),
+            )
+            .await
+            .unwrap();
+        }
         let handle = cache.register_or_get_file(identity(), other);
-        let column = handle.create_row_group(0, vec![]).get_column(0).unwrap();
+        let group = handle.create_row_group(0, vec![]);
+        assert!(group.get_column(1).unwrap().contains(BatchID::from_raw(0)));
+        let column = group.get_column(0).unwrap();
         assert!(!column.contains(BatchID::from_raw(0)));
         assert!(
             column
@@ -2050,11 +2106,39 @@ mod fill_tests {
             column.insert(BatchID::from_raw(1), wide).await,
             Err(crate::cache::column::InsertArrowArrayError::CacheFull)
         ));
-        assert_eq!(cache.storage().stats().total_entries, ROWS / BATCH);
+        assert_eq!(cache.storage().stats().total_entries, 2 * ROWS / BATCH);
         // The decoding it was filled under still reads it.
         let same = cache.register_or_get_file(identity(), schema());
         let column = same.create_row_group(0, vec![]).get_column(0).unwrap();
         assert!(column.contains(BatchID::from_raw(0)));
+    }
+
+    /// Two scans of one file whose tables name different columns decode the
+    /// columns only one of them reads differently (a string its table reads
+    /// as a view, plain in the other's). Each is served every chunk of a
+    /// column both read, and neither pins a column it does not read.
+    #[tokio::test]
+    async fn scans_with_different_projections_share_the_columns_both_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path()).await;
+        let (bytes, metadata) = file();
+        fill(&cache, &metadata, 0, 0, chunk(&bytes, &metadata, 0, 0))
+            .await
+            .unwrap();
+        // This scan's table types `b` otherwise, and reads only `a`.
+        let other = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let handle = cache.register_or_get_file(identity(), other);
+        let group = handle.create_row_group_of(0, &[0]);
+        assert!(group.get_column(1).is_none());
+        assert!(group.get_column(0).unwrap().contains(BatchID::from_raw(0)));
+        // It pinned nothing for `b`: a fill of `b` as the table types it goes in.
+        fill(&cache, &metadata, 0, 1, chunk(&bytes, &metadata, 0, 1))
+            .await
+            .unwrap();
+        assert_eq!(cache.holds_all(&identity(), &[(0, ROWS)], &[0, 1]), [true]);
     }
 
     #[tokio::test]

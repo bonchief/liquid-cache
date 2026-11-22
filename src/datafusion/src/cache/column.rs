@@ -25,7 +25,8 @@ pub struct CachedColumn {
     /// The unnarrowed id of the file this column belongs to. `column_path`
     /// keeps only its low 16 bits, so another file can compute the same
     /// entry ids; the cache serves an entry only to the identity it was
-    /// cached for.
+    /// cached for. [`FOREIGN`](crate::cache::registry::FOREIGN) when this
+    /// handle decodes the column to another type than its entries hold.
     file_identity: u64,
     /// Keeps the file registered, so its slot is not handed to another file
     /// while this column can still insert under it.
@@ -279,7 +280,8 @@ impl CachedColumn {
         if self.contains(batch_id) {
             return Err(InsertArrowArrayError::AlreadyCached);
         }
-        // A handle whose decoding is not its file's keeps nothing; its reads
+        // A handle whose type for the column is not its entries' keeps
+        // nothing; its reads
         // take what they read as they do when the cache is full.
         if self.file_identity == crate::cache::registry::FOREIGN {
             return Err(InsertArrowArrayError::CacheFull);
