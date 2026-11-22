@@ -642,6 +642,10 @@ impl LiquidCacheParquet {
 
     /// Register a file in the cache, attaching typed lineage expressions derived from
     /// the query plan (keyed by file-schema column name).
+    ///
+    /// The file's entries hold the decoding its first registration names
+    /// in `full_file_schema`. A handle registered with other fields is
+    /// served none of them and inserts none: its reads miss and fall back.
     pub fn register_or_get_file_with_hints(
         &self,
         file_identity: ParquetFileIdentity,
@@ -649,7 +653,10 @@ impl LiquidCacheParquet {
         lineages: Arc<ColumnLineages>,
     ) -> CachedFileRef {
         let mut files = self.files();
-        let (key, lease, new) = files.register(file_identity);
+        let (mut key, lease, new) = files.register(file_identity.clone());
+        if !files.decodes_as(&file_identity, full_file_schema.fields()) {
+            key.identity = registry::FOREIGN;
+        }
         let sweep = new && files.should_sweep();
         drop(files);
         let file = Arc::new(CachedFile::new(
@@ -809,6 +816,9 @@ impl LiquidCacheParquet {
         // Registered under the schema a read registers it under, and held for
         // the fill, so the file's slot is not handed on while it inserts.
         let cached = self.register_or_get_file(file.clone(), Arc::clone(reader.schema()));
+        if cached.key.identity == registry::FOREIGN {
+            return Err(FillError::Schema);
+        }
         if self.holds_all(&file, &[(rg, rows)], &[col]) == [true] {
             return Ok(0);
         }
@@ -1887,6 +1897,51 @@ mod fill_tests {
             cache.held_on_disk(&identity(), &groups, &[0, 1]),
             [true, false]
         );
+    }
+
+    #[tokio::test]
+    async fn a_file_cached_under_one_decoding_serves_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path()).await;
+        let (bytes, metadata) = file();
+        // A read registered the file decoding `a` as Int64.
+        let other = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let read = cache.register_or_get_file(identity(), Arc::clone(&other));
+        assert_ne!(read.key.identity, registry::FOREIGN);
+        let filled = fill(&cache, &metadata, 0, 0, chunk(&bytes, &metadata, 0, 0)).await;
+        assert!(matches!(filled, Err(FillError::Schema)), "{filled:?}");
+        assert_eq!(cache.storage().stats().total_entries, 0);
+        drop(read);
+
+        // Filled first: a read decoding otherwise is served nothing and
+        // inserts nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = self::cache(dir.path()).await;
+        fill(&cache, &metadata, 0, 0, chunk(&bytes, &metadata, 0, 0))
+            .await
+            .unwrap();
+        let handle = cache.register_or_get_file(identity(), other);
+        let column = handle.create_row_group(0, vec![]).get_column(0).unwrap();
+        assert!(!column.contains(BatchID::from_raw(0)));
+        assert!(
+            column
+                .get_arrow_array_test_only(BatchID::from_raw(0))
+                .await
+                .is_none()
+        );
+        let wide: ArrayRef = Arc::new(arrow::array::Int64Array::from_iter_values(0..4));
+        assert!(matches!(
+            column.insert(BatchID::from_raw(1), wide).await,
+            Err(crate::cache::column::InsertArrowArrayError::CacheFull)
+        ));
+        assert_eq!(cache.storage().stats().total_entries, ROWS / BATCH);
+        // The decoding it was filled under still reads it.
+        let same = cache.register_or_get_file(identity(), schema());
+        let column = same.create_row_group(0, vec![]).get_column(0).unwrap();
+        assert!(column.contains(BatchID::from_raw(0)));
     }
 
     #[tokio::test]

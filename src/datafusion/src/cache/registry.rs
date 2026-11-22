@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
+use arrow_schema::Fields;
 
 use super::ParquetFileIdentity;
 
@@ -24,6 +25,12 @@ const MIN_SWEEP_AT: usize = 1024;
 
 /// How many distinct values the cache key's 16-bit file field holds.
 const SLOTS: usize = 1 << 16;
+
+/// The identity of a handle whose decoded schema is not the one its file's
+/// entries were cached under (see [`FileRegistry::decodes_as`]). Never handed
+/// out to a registration, so nothing is cached under it: such a handle is
+/// served nothing and inserts nothing.
+pub(crate) const FOREIGN: u64 = u64::MAX;
 
 /// Where a registered file's entries live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +59,9 @@ struct RegisteredFile {
     /// Bumped on every registration, so a sweep can tell that a handle was
     /// created (and possibly dropped again) while it scanned the cache.
     registrations: u64,
+    /// The Arrow fields the file's entries are decoded to: those of its
+    /// first registration.
+    fields: Option<Fields>,
 }
 
 /// A file a sweep may forget, as it was when the sweep started.
@@ -119,9 +129,29 @@ impl FileRegistry {
                 key,
                 lease: lease.clone(),
                 registrations: 0,
+                fields: None,
             },
         );
         (key, lease, true)
+    }
+
+    /// Whether a handle decoding `identity` to `fields` reads the entries
+    /// cached for it. **A file's entries hold one decoding**: the first
+    /// registration pins the fields, and a later one with other fields
+    /// (another type for a column, say views against plain strings) is
+    /// refused, so a read never gets an array of a type it did not decode
+    /// to. An unregistered file is refused too.
+    pub(crate) fn decodes_as(&mut self, identity: &ParquetFileIdentity, fields: &Fields) -> bool {
+        let Some(file) = self.files.get_mut(identity) else {
+            return false;
+        };
+        match &file.fields {
+            Some(pinned) => pinned == fields,
+            None => {
+                file.fields = Some(fields.clone());
+                true
+            }
+        }
     }
 
     /// Where `identity`'s entries live, if it is registered.

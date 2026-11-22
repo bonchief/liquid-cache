@@ -270,6 +270,11 @@ impl CachedColumn {
         if self.contains(batch_id) {
             return Err(InsertArrowArrayError::AlreadyCached);
         }
+        // A handle whose decoding is not its file's keeps nothing; its reads
+        // take what they read as they do when the cache is full.
+        if self.file_identity == crate::cache::registry::FOREIGN {
+            return Err(InsertArrowArrayError::CacheFull);
+        }
 
         self.cache_store
             .insert(self.entry_id(batch_id).into(), self.file_identity, array)

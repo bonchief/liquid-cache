@@ -33,6 +33,9 @@ pub enum FillError {
     Arrow(ArrowError),
     /// The cache refused the chunk; none of it was kept.
     Full,
+    /// The file's entries are cached decoded to other types than `schema`
+    /// decodes it to: a read registered it first with another table schema.
+    Schema,
 }
 
 impl std::fmt::Display for FillError {
@@ -43,6 +46,10 @@ impl std::fmt::Display for FillError {
             Self::Decode(error) => write!(out, "the column chunk did not decode: {error}"),
             Self::Arrow(error) => write!(out, "a decoded batch was malformed: {error}"),
             Self::Full => write!(out, "the cache has no room for the column chunk"),
+            Self::Schema => write!(
+                out,
+                "the file is cached decoded to other types than this fill's schema"
+            ),
         }
     }
 }
