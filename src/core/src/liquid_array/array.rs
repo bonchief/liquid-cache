@@ -69,7 +69,14 @@ pub struct LiquidArray {
 impl LiquidArray {
     /// Transcode a supported Arrow array into Vortex.
     pub fn from_arrow_array(array: &ArrayRef) -> Result<Self, &ArrayRef> {
-        Self::compress(array).map(Self::compacted)
+        let compressed = Self::compress(array)?;
+        compressed.compacted().map_err(|error| {
+            log::warn!(
+                "a {:?} array transcoded to Liquid did not decode back: {error}",
+                array.data_type()
+            );
+            array
+        })
     }
 
     /// The compressor's output, which can still share memory with `array`
@@ -114,7 +121,10 @@ impl LiquidArray {
     /// are freed only with the entry. Round-tripping through the
     /// serialization the disk tier uses drops those allocations, and leaves
     /// an array whose heap [`heap_size`] can account for.
-    fn compacted(self) -> Self {
+    ///
+    /// A block that does not decode back is an error, never a panic: the
+    /// caller keeps the Arrow array.
+    fn compacted(self) -> VortexResult<Self> {
         let (alignment, pieces) = self.encode();
         let len = pieces.iter().map(ByteBuffer::len).sum();
         let mut block = ByteBufferMut::with_capacity_aligned(len, alignment);
@@ -122,7 +132,7 @@ impl LiquidArray {
             block.extend_from_slice(piece);
         }
         drop((self, pieces));
-        Self::decode(block.freeze())
+        Self::try_decode(block.freeze())
     }
 
     /// Deserialize a Vortex-backed Liquid array.
@@ -149,13 +159,6 @@ impl LiquidArray {
     /// did not write.
     pub fn try_from_bytes(bytes: Bytes) -> VortexResult<Self> {
         Self::try_decode(ByteBuffer::from(bytes))
-    }
-
-    /// Decode a block this process serialized itself, in [`Self::compacted`].
-    fn decode(block: ByteBuffer) -> Self {
-        Self::try_decode(block).unwrap_or_else(|error| {
-            panic!("a Liquid array this process encoded must decode: {error}")
-        })
     }
 
     /// Decode a serialized block, keeping every buffer of the result a
@@ -1170,7 +1173,7 @@ mod tests {
             .unwrap();
         drop(fsst);
 
-        let liquid = compressed.compacted();
+        let liquid = compressed.compacted().unwrap();
         let codes = codes
             .try_into_mut()
             .expect("the entry still holds the compressor's codes allocation");
