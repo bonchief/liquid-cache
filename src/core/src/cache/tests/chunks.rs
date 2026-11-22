@@ -217,7 +217,7 @@ fn faulty_store(
 async fn an_injected_disk_fault_takes_a_real_fault_s_path() {
     use std::sync::atomic::Ordering;
     let directory = tempfile::tempdir().unwrap();
-    let (store, writes, reads) = faulty_store(directory.path());
+    let (store, writes, _) = faulty_store(directory.path());
     let cache = cache(1 << 30, Some(store.clone())).await;
 
     // ENOSPC on the spill: the chunk is dropped and its disk given back.
