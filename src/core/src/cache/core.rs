@@ -878,7 +878,18 @@ impl LiquidCache {
             if victims.is_empty() {
                 // no advice, because the cache is already empty
                 // this can happen if the entry to be inserted is too large, in that case,
-                // we write it to disk
+                // we write it to disk. Its record is charged memory however
+                // full the budget is (see `try_insert`), so with no room for
+                // even that the insert is refused: records stay bounded by
+                // the memory budget.
+                if self
+                    .budget
+                    .memory_usage_bytes()
+                    .saturating_add(CacheEntry::DISK_RECORD_BYTES)
+                    > self.config.max_memory_bytes()
+                {
+                    return Err(CacheFull);
+                }
                 let (on_disk_batch, written) = self
                     .write_in_memory_batch_to_disk(entry_id, identity, not_inserted)
                     .await?;
@@ -1026,9 +1037,10 @@ impl LiquidCache {
         // cannot then be dropped, taking its charge, while the caller retries
         // the record. Usage can exceed the maximum by those charges only
         // while records alone fill it, which a disk budget D allows only when
-        // the memory budget is below D / 16: every record also holds an
-        // extent of at least one 4 KiB page, so there are at most D / 4096 of
-        // them. Owners size the memory budget at or above that.
+        // the memory budget is below D / 16: every record also holds at least
+        // a 4 KiB page of the disk budget (`Self::DISK_SHARE_FLOOR`), so there
+        // are at most D / 4096 of them. Owners size the memory budget at or
+        // above that.
         let assumed_old_size = self
             .index
             .get(&entry_id)
@@ -1084,9 +1096,8 @@ impl LiquidCache {
         Ok(orphan)
     }
 
-    /// The disk budget a record holds: its share of the extent its object
-    /// takes, header, directory and padding included
-    /// ([`DiskStore::chunk_footprint`]).
+    /// The disk budget a record holds: its share of what its object is
+    /// charged ([`Self::disk_charge`]).
     fn charged_bytes(entry: &CacheEntry) -> Option<usize> {
         match entry {
             CacheEntry::DiskLiquid { disk_bytes, .. }
@@ -1370,6 +1381,13 @@ impl LiquidCache {
                     victim.step = Step::Drop;
                 }
             }
+            // An eviction frees memory. Records cost memory too, so a chunk
+            // whose batches hold less than their records would cost is
+            // dropped rather than spilled.
+            if !Self::spill_frees_memory(&victims) {
+                self.drop_chunk(&victims);
+                return;
+            }
         }
         if victims.iter().any(|victim| matches!(victim.step, Step::Drop)) {
             self.drop_chunk(&victims);
@@ -1399,6 +1417,22 @@ impl LiquidCache {
             return;
         }
         self.spill_chunk(victims).await;
+    }
+
+    /// Whether spilling `victims` frees memory: what the members going to
+    /// disk hold now is more than their records will be charged
+    /// ([`CacheEntry::DISK_RECORD_BYTES`] each).
+    fn spill_frees_memory(victims: &[Victim]) -> bool {
+        let (held, records) = victims
+            .iter()
+            .filter(|victim| matches!(victim.step, Step::Spill { .. }))
+            .fold((0usize, 0usize), |(held, records), victim| {
+                (
+                    held.saturating_add(victim.current.memory_usage_bytes()),
+                    records.saturating_add(CacheEntry::DISK_RECORD_BYTES),
+                )
+            });
+        held > records
     }
 
     fn any_spill(victims: &[Victim]) -> bool {
@@ -1710,8 +1744,8 @@ impl LiquidCache {
     /// changed hands can leave one identity's bytes where another's entry
     /// points. The store's header names the identity, so a read under the
     /// other one misses. The disk budget is charged the extent the object
-    /// takes ([`DiskStore::chunk_footprint`]), split exactly among the
-    /// batches' records, so the object is charged once.
+    /// takes, at least a page per batch ([`Self::disk_charge`]), split
+    /// exactly among the batches' records, so the object is charged once.
     ///
     /// A failed put is counted and refused like a full disk: the caller drops
     /// the entries. The store then holds no new object for them, and each key
@@ -1735,8 +1769,7 @@ impl LiquidCache {
             return Err(CacheFull);
         }
         self.delete_strays().await;
-        let charged = DiskStore::chunk_footprint(batches.iter().map(|batch| batch.bytes().len()))
-            .ok_or(CacheFull)?;
+        let charged = Self::disk_charge(&batches).ok_or(CacheFull)?;
         loop {
             if self.budget.try_reserve_disk(charged).is_ok() {
                 break;
@@ -1792,6 +1825,26 @@ impl LiquidCache {
             })
             .collect();
         Ok(ChunkWrite { key_lock, members })
+    }
+
+    /// The least disk budget one batch's record is charged: a page.
+    ///
+    /// Every record is also charged [`CacheEntry::DISK_RECORD_BYTES`] of
+    /// memory. One object holds a whole chunk, so a chunk of small batches
+    /// (a constant column, say) puts many records in one page; charged its
+    /// extent alone, a disk budget D would admit far more than D / 4096
+    /// records, and their metadata would outgrow any memory budget sized
+    /// from D. With this floor there are at most D / 4096 records.
+    const DISK_SHARE_FLOOR: usize = 4096;
+
+    /// The disk budget an object holding `batches` is charged: the extent it
+    /// takes ([`DiskStore::chunk_footprint`]), or [`Self::DISK_SHARE_FLOOR`]
+    /// per batch if that is more. `None` past what an object can address.
+    fn disk_charge(batches: &[StoredBatch]) -> Option<usize> {
+        let footprint =
+            DiskStore::chunk_footprint(batches.iter().map(|batch| batch.bytes().len()))?;
+        let floor = batches.len().checked_mul(Self::DISK_SHARE_FLOOR)?;
+        Some(footprint.max(floor))
     }
 
     /// The payload stored for `entry_id`, if it was written for `identity`.
@@ -1955,7 +2008,9 @@ impl LiquidCache {
     /// Insert every batch of one chunk for `identity`, each a memory entry
     /// from [`Self::encode`]. All go in or none: on a refusal the batches
     /// already inserted are evicted again, so a chunk is never left part
-    /// cached by its insert.
+    /// cached by its insert. That includes a later batch's eviction picking
+    /// this very chunk, which the policy files from its first batch on: its
+    /// earlier batches are then gone, and the rest are taken out too.
     pub async fn insert_chunk(
         &self,
         identity: u64,
@@ -1968,6 +2023,13 @@ impl LiquidCache {
                 return Err(CacheFull);
             }
             inserted.push(entry);
+        }
+        if inserted
+            .iter()
+            .any(|entry| !self.index.contains(entry, identity))
+        {
+            self.remove_inserted(&inserted, identity).await;
+            return Err(CacheFull);
         }
         Ok(())
     }
