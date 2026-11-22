@@ -1416,6 +1416,80 @@ mod tests {
         assert_eq!(metadata_cache_hits(0).await, (None, None));
     }
 
+    /// What reading the two-row-group file through a [`LiquidParquetSource`]
+    /// left: the columns read, and the cache it read with.
+    struct SourceRead {
+        a: Vec<i32>,
+        b: Vec<i32>,
+        cache: Arc<LiquidCacheParquet>,
+    }
+
+    /// Read the two-row-group file through a source made from a stock
+    /// `ParquetSource`, its part marked [`crate::reader::Held`] or not, with
+    /// fill on or off.
+    async fn read_through_source(held: bool, fill: bool) -> SourceRead {
+        let schema = schema();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let parquet_path = tmp_dir.path().join("data.parquet");
+        write_two_row_group_file(&parquet_path, Arc::clone(&schema));
+        let mut file = PartitionedFile::new(
+            "data.parquet",
+            std::fs::metadata(&parquet_path).unwrap().len(),
+        );
+        if held {
+            file.extensions.insert(crate::reader::Held);
+        }
+        let object_store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(tmp_dir.path()).unwrap());
+        let parquet_source = ParquetSource::new(Arc::clone(&schema))
+            .with_parquet_file_reader_factory(Arc::new(DefaultParquetFileReaderFactory::new(
+                Arc::clone(&object_store),
+            )));
+        let cache = create_test_cache(tmp_dir.path(), usize::MAX, usize::MAX).await;
+        let source = LiquidParquetSource::from_parquet_source(parquet_source, Arc::clone(&cache))
+            .with_fill(fill);
+        let base_config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(source.clone()),
+        )
+        .with_file(file.clone())
+        .build();
+        let morselizer = source
+            .create_morselizer(object_store, &base_config, 0)
+            .unwrap();
+        let morsels = drive_planner(morselizer.plan_file(file).unwrap()).await;
+        let (a, b) = collect_columns(morsels).await;
+        SourceRead { a, b, cache }
+    }
+
+    #[tokio::test]
+    async fn a_part_without_held_reads_through_the_stock_path() {
+        let plain = read_through_source(false, true).await;
+        assert_eq!(plain.a, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(plain.b, vec![10, 11, 12, 13, 14, 15, 16, 17]);
+        // The cache reader, filling, would have inserted every batch read.
+        assert_eq!(plain.cache.storage().stats().total_entries, 0);
+        assert_eq!(plain.cache.counters().raced, 0);
+
+        let held = read_through_source(true, true).await;
+        assert_eq!((held.a, held.b), (plain.a, plain.b));
+        assert_eq!(held.cache.storage().stats().total_entries, 4);
+    }
+
+    #[tokio::test]
+    async fn with_fill_off_a_held_part_inserts_nothing() {
+        let read = read_through_source(true, false).await;
+        assert_eq!(read.a, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(read.b, vec![10, 11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(read.cache.storage().stats().total_entries, 0);
+        assert_eq!(read.cache.memory_usage_bytes(), 0);
+        assert!(
+            read.cache.counters().raced > 0,
+            "the misses were not counted"
+        );
+        assert_eq!(read.cache.counters().fills_done, 0);
+    }
+
     fn gt_expr(column_name: &str, column_index: usize, literal: i32) -> Arc<dyn PhysicalExpr> {
         Arc::new(BinaryExpr::new(
             Arc::new(Column::new(column_name, column_index)),

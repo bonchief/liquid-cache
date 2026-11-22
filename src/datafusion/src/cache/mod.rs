@@ -30,8 +30,8 @@ mod registry;
 mod stats;
 
 pub use column::{CachedColumn, CachedColumnRef};
-pub use fill::{FillError, chunk_span};
 pub(crate) use column::{InsertArrowArrayError, PrefetchOutcome};
+pub use fill::{FillError, chunk_span};
 pub(crate) use id::ColumnAccessPath;
 pub use id::{BATCH_BITS, BatchID, ParquetArrayID};
 use registry::{FileKey, FileLease, FileRegistry};
@@ -1648,5 +1648,194 @@ mod registry_tests {
         unsafe { cache.reset() };
         assert_eq!(cache.leased_file_ids(), 0);
         assert_eq!(cache.metadata.hinted_columns(), 0);
+    }
+}
+
+#[cfg(test)]
+mod fill_tests {
+    use super::*;
+    use arrow::array::{ArrayRef, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use bytes::Bytes;
+    use liquid_cache::cache::{AlwaysHydrate, Evict};
+    use liquid_cache::cache_policies::LiquidPolicy;
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+
+    const BATCH: usize = 4;
+    /// Rows per row group: two batches per column chunk.
+    const ROWS: usize = 8;
+
+    fn schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]))
+    }
+
+    fn identity() -> ParquetFileIdentity {
+        ParquetFileIdentity::new(
+            ObjectStoreUrl::local_filesystem(),
+            "table/file.parquet".to_string(),
+        )
+    }
+
+    /// A file of two row groups of [`ROWS`] rows: its bytes and its footer.
+    fn file() -> (Bytes, Arc<ParquetMetaData>) {
+        let mut out = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut out, schema(), None).unwrap();
+        for group in 0..2 {
+            let a = Int32Array::from_iter_values((0..ROWS as i32).map(|v| v + group * 100));
+            let b = Int32Array::from_iter_values((0..ROWS as i32).map(|v| v + group * 100 + 1000));
+            let batch = RecordBatch::try_new(schema(), vec![Arc::new(a), Arc::new(b)]).unwrap();
+            writer.write(&batch).unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+        let bytes = Bytes::from(out);
+        let metadata = ParquetMetaDataReader::new()
+            .parse_and_finish(&bytes)
+            .unwrap();
+        (bytes, Arc::new(metadata))
+    }
+
+    /// The bytes of column `column` of row group `group`, as a filler
+    /// fetches them.
+    fn chunk(bytes: &Bytes, metadata: &ParquetMetaData, group: usize, column: usize) -> Bytes {
+        let span = chunk_span(metadata, group, column).unwrap();
+        bytes.slice(span.start as usize..span.end as usize)
+    }
+
+    async fn cache(dir: &std::path::Path) -> LiquidCacheParquet {
+        let store = liquid_cache::cache::DiskStore::mount(
+            dir.join("liquid_cache.disk"),
+            liquid_cache::cache::DiskOptions::default(),
+        )
+        .unwrap();
+        LiquidCacheParquet::new(
+            BATCH,
+            usize::MAX,
+            usize::MAX,
+            store,
+            Box::new(LiquidPolicy::new()),
+            Box::new(Evict),
+            Box::new(AlwaysHydrate::new()),
+        )
+        .await
+    }
+
+    async fn fill(
+        cache: &LiquidCacheParquet,
+        metadata: &Arc<ParquetMetaData>,
+        group: usize,
+        column: usize,
+        bytes: Bytes,
+    ) -> Result<usize, FillError> {
+        cache
+            .fill(
+                identity(),
+                schema(),
+                Arc::clone(metadata),
+                group,
+                column,
+                bytes,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn holds_all_needs_every_batch_of_every_asked_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path()).await;
+        let (bytes, metadata) = file();
+        let groups = [(0, ROWS), (1, ROWS)];
+        assert_eq!(cache.holds_all(&identity(), &groups, &[0]), [false, false]);
+
+        let filled = fill(&cache, &metadata, 0, 0, chunk(&bytes, &metadata, 0, 0)).await;
+        assert_eq!(filled.unwrap(), ROWS / BATCH);
+        assert_eq!(cache.holds_all(&identity(), &groups, &[0]), [true, false]);
+        // Column 1 of row group 0 is not held, so neither is the pair.
+        assert_eq!(
+            cache.holds_all(&identity(), &groups, &[0, 1]),
+            [false, false]
+        );
+        // More rows than the chunk holds name batches it does not have.
+        assert_eq!(
+            cache.holds_all(&identity(), &[(0, 2 * ROWS)], &[0]),
+            [false]
+        );
+
+        let filled = fill(&cache, &metadata, 0, 1, chunk(&bytes, &metadata, 0, 1)).await;
+        assert_eq!(filled.unwrap(), ROWS / BATCH);
+        assert_eq!(
+            cache.holds_all(&identity(), &groups, &[0, 1]),
+            [true, false]
+        );
+
+        // One batch of a chunk is not the chunk.
+        let handle = cache.register_or_get_file(identity(), schema());
+        let column = handle.create_row_group(1, vec![]).get_column(0).unwrap();
+        let first: ArrayRef = Arc::new(Int32Array::from_iter_values(100..104));
+        column.insert(BatchID::from_raw(0), first).await.unwrap();
+        assert_eq!(cache.holds_all(&identity(), &groups, &[0]), [true, false]);
+
+        // On disk is held too.
+        cache.flush_data().await.unwrap();
+        assert_eq!(cache.storage().stats().memory_arrow_entries, 0);
+        assert_eq!(cache.storage().stats().memory_liquid_entries, 0);
+        assert_eq!(
+            cache.holds_all(&identity(), &groups, &[0, 1]),
+            [true, false]
+        );
+
+        // A chunk the cache holds whole already is left as it is.
+        let again = fill(&cache, &metadata, 0, 0, chunk(&bytes, &metadata, 0, 0)).await;
+        assert_eq!(again.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn fill_refuses_bad_bytes_without_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path()).await;
+        let (bytes, metadata) = file();
+        let whole = chunk(&bytes, &metadata, 0, 0);
+
+        let truncated = whole.slice(..whole.len() - 1);
+        assert!(matches!(
+            fill(&cache, &metadata, 0, 0, truncated).await,
+            Err(FillError::Partial)
+        ));
+        let empty = Bytes::new();
+        assert!(matches!(
+            fill(&cache, &metadata, 0, 0, empty).await,
+            Err(FillError::Partial)
+        ));
+        for pattern in [0x00, 0xAB, 0xFF] {
+            let garbage = Bytes::from(vec![pattern; whole.len()]);
+            let filled = fill(&cache, &metadata, 0, 0, garbage).await;
+            assert!(
+                matches!(filled, Err(FillError::Decode(_) | FillError::Arrow(_))),
+                "garbage of {pattern:#x} filled: {filled:?}"
+            );
+        }
+        // Garbage after a good page header: the chunk's head, then noise.
+        let mut torn = whole.to_vec();
+        let half = torn.len() / 2;
+        torn[half..].fill(0x5A);
+        let filled = fill(&cache, &metadata, 0, 0, Bytes::from(torn)).await;
+        assert!(filled.is_err(), "a torn chunk filled: {filled:?}");
+        assert!(matches!(
+            fill(&cache, &metadata, 5, 0, whole.clone()).await,
+            Err(FillError::NoSuchChunk)
+        ));
+        assert!(matches!(
+            fill(&cache, &metadata, 0, 9, whole).await,
+            Err(FillError::NoSuchChunk)
+        ));
+
+        assert_eq!(cache.storage().stats().total_entries, 0);
+        assert_eq!(cache.counters().fills_done, 0);
+        assert_eq!(cache.counters().fills_refused, 8);
+        assert_eq!(cache.holds_all(&identity(), &[(0, ROWS)], &[0]), [false]);
     }
 }
