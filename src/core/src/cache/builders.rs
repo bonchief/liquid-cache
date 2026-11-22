@@ -164,7 +164,7 @@ impl LiquidCacheBuilder {
                     .min(1 << 40);
                 DiskStore::mount(
                     cache_dir.join("liquid_cache.disk"),
-                    DiskOptions::new(capacity),
+                    DiskOptions::for_budget(capacity),
                 )
                 .expect("failed to mount the disk store")
             }

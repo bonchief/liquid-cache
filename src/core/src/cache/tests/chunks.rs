@@ -294,3 +294,31 @@ async fn a_disk_read_holds_its_memory_against_the_read_budget() {
         BATCHES
     );
 }
+
+#[tokio::test]
+async fn a_full_store_with_budget_to_spare_drops_disk_victims_and_retries() {
+    // The store's file holds one chunk's object; the budget, far more.
+    let measure = cache(1 << 30, None).await;
+    insert_chunk(&measure, 1).await;
+    measure.insert(entry(2, 0), 0, array(20)).await.unwrap();
+    let one_chunk = measure.stats().disk_usage_bytes as u64;
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = DiskStore::mount(
+        directory.path().join("tier.disk"),
+        DiskOptions::new(one_chunk),
+    )
+    .unwrap();
+    let cache = cache(1 << 30, Some(store.clone())).await;
+    insert_chunk(&cache, 1).await;
+    insert_chunk(&cache, 2).await;
+    assert_eq!(tiers(&cache, 1), vec![Some(true); BATCHES]);
+    // Chunk 2 spills: the store is full, so chunk 1 leaves the disk for it.
+    insert_chunk(&cache, 3).await;
+    assert_eq!(tiers(&cache, 1), vec![None; BATCHES]);
+    assert_eq!(tiers(&cache, 2), vec![Some(true); BATCHES]);
+    assert_eq!(cache.counters().chunks_dropped_from_disk, 1);
+    assert_eq!(cache.stats().runtime.disk_write_failures, 0);
+    let read = cache.read_chunk(&entry(2, 0), 0).await;
+    assert_eq!(read.entries.len(), BATCHES);
+}

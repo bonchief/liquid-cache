@@ -1776,9 +1776,15 @@ impl LiquidCache {
     /// A failed put is counted and refused like a full disk: the caller drops
     /// the entries. The store then holds no new object for them, and each key
     /// is left to [`StrayObjects`], which deletes any older name no record
-    /// relies on. A put the store refuses for want of a long enough free
-    /// extent is such a failure too; evicting disk victims for it would take
-    /// their chunks' locks while this one's is held.
+    /// relies on.
+    ///
+    /// **A store that is full while the budget has room is pressure, not a
+    /// failure.** The store's bytes in use can pass the disk budget: an
+    /// extent stays while any batch of its chunk names it or a read pins it,
+    /// and free space can be in pieces too short for the object. So a put
+    /// the store refuses with [`DiskError::Full`] lets go of this chunk's
+    /// lock, drops disk victims as the budget does, and tries again, at most
+    /// [`Self::STORE_FULL_RETRIES`] times; only then is it refused.
     async fn write_chunk(
         &self,
         identity: u64,
@@ -1826,20 +1832,40 @@ impl LiquidCache {
             });
         }
         let entries: Vec<EntryID> = batches.iter().map(StoredBatch::entry).collect();
-        // Taken only now: removing the victims above takes their chunks' locks.
-        let key_lock = self.disk_key_locks.lock(&chunk).await;
-        let unnamed: Vec<UnfinishedObject<'_>> = entries
-            .iter()
-            .map(|entry| self.unfinished_object(*entry))
-            .collect();
-        if let Err(error) = self
-            .store
-            .put_chunk(ObjectKey::new(chunk, identity), batches)
-            .await
-        {
-            self.observer.on_disk_write_failure(&error);
-            return Err(CacheFull);
-        }
+        let mut tries = 0;
+        let (key_lock, unnamed) = loop {
+            // Taken only now: removing victims takes their chunks' locks.
+            let key_lock = self.disk_key_locks.lock(&chunk).await;
+            let unnamed: Vec<UnfinishedObject<'_>> = entries
+                .iter()
+                .map(|entry| self.unfinished_object(*entry))
+                .collect();
+            let put = self
+                .store
+                .put_chunk(ObjectKey::new(chunk, identity), batches.clone())
+                .await;
+            match put {
+                Ok(()) => break (key_lock, unnamed),
+                Err(DiskError::Full) if tries < Self::STORE_FULL_RETRIES => {
+                    tries += 1;
+                    drop((unnamed, key_lock));
+                    let victims = self.cache_policy.find_disk_victim(8);
+                    if victims.is_empty() {
+                        self.observer.on_disk_write_failure(&DiskError::Full);
+                        return Err(CacheFull);
+                    }
+                    let dropped = self.by_chunk(victims);
+                    TierEvents::add(&self.events.dropped_from_disk, dropped.len() as u64);
+                    for victim in dropped.into_iter().flatten() {
+                        self.remove_disk_entry(victim).await;
+                    }
+                }
+                Err(error) => {
+                    self.observer.on_disk_write_failure(&error);
+                    return Err(CacheFull);
+                }
+            }
+        };
         let members = charge
             .split(unnamed.len())
             .into_iter()
@@ -1852,6 +1878,10 @@ impl LiquidCache {
             .collect();
         Ok(ChunkWrite { key_lock, members })
     }
+
+    /// How many times a put the store refuses as full drops disk victims and
+    /// tries again before it is refused.
+    const STORE_FULL_RETRIES: usize = 4;
 
     /// The least disk budget one batch's record is charged: a page.
     ///

@@ -127,6 +127,21 @@ impl DiskOptions {
         }
     }
 
+    /// A store for a cache whose disk budget is `budget` bytes: its file
+    /// `budget` plus an eighth, and at least 64 MiB more.
+    ///
+    /// The store's bytes in use can pass the budget the cache charges: an
+    /// extent stays whole while any batch of its chunk still names it, a
+    /// replaced extent stays while a read pins it (at most what the read
+    /// budget lets reads hold), and free space can lie in pieces too short
+    /// for an object. The cache drops disk victims when the store is full
+    /// all the same, so headroom only spares those drops. The file is
+    /// sparse: the headroom takes no blocks until written, but the
+    /// filesystem must have room for it.
+    pub fn for_budget(budget: u64) -> Self {
+        Self::new(budget.saturating_add((budget / 8).max(64 << 20)))
+    }
+
     /// Bypass the page cache: `O_DIRECT` on Linux, `F_NOCACHE` on macOS.
     /// Filesystems that refuse `O_DIRECT`, such as tmpfs on older kernels,
     /// then fail the mount. Buffered, reads keep their pages cached and

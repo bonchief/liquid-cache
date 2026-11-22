@@ -2017,7 +2017,11 @@ mod fill_tests {
         fill(&cache, &metadata, 0, 0, chunk(&bytes, &metadata, 0, 0))
             .await
             .unwrap();
-        assert_eq!(reads.used(), 0, "a fill holds its charge only while it runs");
+        assert_eq!(
+            reads.used(),
+            0,
+            "a fill holds its charge only while it runs"
+        );
         cache.flush_data().await.unwrap();
 
         // A held read keeps what it read, and its charge, until the row
