@@ -43,6 +43,10 @@ impl EvictionPolicy for Evict {
 }
 
 /// Transcode Arrow to Liquid before eventually evicting it to disk.
+///
+/// A transcode that does not shrink the array is not kept: holding a Liquid
+/// form at least as large as the Arrow one frees nothing. The Arrow victim
+/// goes to disk as Arrow instead.
 #[derive(Debug, Default, Clone)]
 pub struct TranscodeEvict;
 
@@ -50,11 +54,13 @@ impl EvictionPolicy for TranscodeEvict {
     fn evict(&self, entry: &CacheEntry, _lineage: Option<&CacheExpression>) -> EvictionOutcome {
         match entry {
             CacheEntry::MemoryArrow(array) => match LiquidArray::from_arrow_array(array) {
-                Ok(liquid) => EvictionOutcome::Replace {
-                    entry: CacheEntry::memory_liquid(Arc::new(liquid)),
-                    bytes_to_write: None,
-                },
-                Err(_) => persist(entry),
+                Ok(liquid) if liquid.get_array_memory_size() < array.get_array_memory_size() => {
+                    EvictionOutcome::Replace {
+                        entry: CacheEntry::memory_liquid(Arc::new(liquid)),
+                        bytes_to_write: None,
+                    }
+                }
+                Ok(_) | Err(_) => persist(entry),
             },
             _ => persist(entry),
         }

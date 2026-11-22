@@ -500,8 +500,6 @@ impl LiquidCache {
         self.background_text.get()
     }
 
-    /// Replace `entry_id`'s Arrow `array` by `liquid`, if its slot still holds
-    /// that very array for `identity`; otherwise the transcode is dropped.
     /// The Arrow array `entry_id` holds for `identity`, if it holds one.
     pub(crate) fn held_arrow(&self, entry_id: &EntryID, identity: u64) -> Option<ArrayRef> {
         let slot = self.index.get(entry_id)?;
@@ -511,6 +509,9 @@ impl LiquidCache {
         }
     }
 
+    /// Replace `entry_id`'s Arrow `array` by `liquid`, if its slot still holds
+    /// that very array for `identity` and `liquid` is smaller; otherwise the
+    /// transcode is dropped.
     pub(crate) async fn swap_in_liquid(
         &self,
         entry_id: EntryID,
@@ -522,7 +523,9 @@ impl LiquidCache {
             slot.belongs_to(identity)
                 && matches!(&slot.entry, CacheEntry::MemoryArrow(held) if Arc::ptr_eq(held, array))
         });
-        if current {
+        // A transcode that does not shrink the array keeps the Arrow entry.
+        let shrinks = liquid.get_array_memory_size() < array.get_array_memory_size();
+        if current && shrinks {
             // A full cache refuses the swap; the Arrow entry stays.
             let _ = self
                 .insert_inner(entry_id, identity, CacheEntry::memory_liquid(liquid))
