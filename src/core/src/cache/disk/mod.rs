@@ -328,7 +328,8 @@ impl DiskStore {
     }
 
     /// Reads, so far, whose extent's header or checksum did not match the
-    /// object asked for.
+    /// object asked for. An object of another identity is a plain miss and
+    /// is not counted.
     pub fn mismatches(&self) -> u64 {
         self.shared.mismatches.load(Ordering::Relaxed)
     }
@@ -401,6 +402,9 @@ impl Shared {
         self.file.read_exact_at(buffer.as_mut_slice(), at)?;
         match Header::check(key, buffer.as_slice()) {
             Ok(payload) => Ok((buffer, payload)),
+            // An object of another identity is the key changing hands, a
+            // plain miss; only a header that does not match is a fault.
+            Err(DiskError::Foreign) => Err(DiskError::Foreign),
             Err(error) => {
                 self.mismatches.fetch_add(1, Ordering::Relaxed);
                 Err(error)
@@ -497,5 +501,187 @@ impl Header {
             return Err(DiskError::Corrupt);
         }
         Ok(payload)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+
+    /// The first entry of chunk `chunk`, with 16 batch bits as the Parquet
+    /// layer packs them.
+    fn chunk(chunk: usize) -> EntryID {
+        EntryID::from(chunk << 16)
+    }
+
+    fn batch(chunk: EntryID, batch: usize) -> EntryID {
+        EntryID::from(usize::from(chunk) + batch)
+    }
+
+    fn batches(chunk: EntryID, count: usize, len: usize) -> Vec<StoredBatch> {
+        (0..count)
+            .map(|index| {
+                let bytes = Bytes::from(vec![index as u8 + 1; len]);
+                StoredBatch::new(batch(chunk, index), 0, bytes)
+            })
+            .collect()
+    }
+
+    fn mounted(capacity: u64) -> (tempfile::TempDir, std::path::PathBuf, DiskStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tier.disk");
+        let store = DiskStore::mount(&path, DiskOptions::new(capacity)).unwrap();
+        (dir, path, store)
+    }
+
+    #[test]
+    fn an_extent_is_not_reused_while_a_read_pins_it() {
+        let mut extents = Extents::new(4 * PAGE);
+        let entry = chunk(1);
+        let at = extents.allocate(PAGE).unwrap();
+        extents.name(entry, at);
+        extents.unpin(at);
+
+        let (pinned, len) = extents.pin_named(&entry).unwrap();
+        assert_eq!((pinned, len), (at, PAGE));
+        assert!(extents.remove(&entry));
+        let others: Vec<u64> = (0..3).map(|_| extents.allocate(PAGE).unwrap()).collect();
+        assert!(!others.contains(&at), "a pinned extent was handed out");
+        assert_eq!(
+            extents.allocate(PAGE),
+            None,
+            "the pinned extent is still held"
+        );
+
+        extents.unpin(pinned);
+        assert_eq!(extents.allocate(PAGE), Some(at));
+    }
+
+    #[test]
+    fn a_shared_extent_is_freed_only_once_no_entry_names_it() {
+        let mut extents = Extents::new(PAGE);
+        let at = extents.allocate(PAGE).unwrap();
+        extents.name(batch(chunk(1), 0), at);
+        extents.name(batch(chunk(1), 1), at);
+        extents.unpin(at);
+        assert!(extents.remove(&batch(chunk(1), 0)));
+        assert_eq!(extents.allocate(PAGE), None);
+        assert!(extents.remove(&batch(chunk(1), 1)));
+        assert_eq!(extents.used(), 0);
+        assert_eq!(extents.allocate(PAGE), Some(at));
+    }
+
+    #[tokio::test]
+    async fn a_chunk_is_read_whole_in_one_object() {
+        let (_dir, _, store) = mounted(1 << 20);
+        let key = ObjectKey::new(chunk(1), 7);
+        store
+            .put_chunk(key, batches(chunk(1), 3, 100))
+            .await
+            .unwrap();
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.used_bytes(), PAGE);
+
+        let object = store.get_chunk(batch(chunk(1), 2), key).await.unwrap();
+        let read: Vec<(EntryID, u8, Bytes)> = object.batches().collect();
+        assert_eq!(read.len(), 3);
+        for (index, (entry, form, bytes)) in read.into_iter().enumerate() {
+            assert_eq!((entry, form), (batch(chunk(1), index), 0));
+            assert_eq!(bytes, Bytes::from(vec![index as u8 + 1; 100]));
+        }
+        assert_eq!(store.mismatches(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_header_that_does_not_match_is_a_miss() {
+        let (_dir, path, store) = mounted(1 << 20);
+        let key = ObjectKey::new(chunk(1), 7);
+        let entry = batch(chunk(1), 0);
+        store
+            .put_chunk(key, batches(chunk(1), 2, 100))
+            .await
+            .unwrap();
+
+        // Another chunk's key: the header names chunk 1.
+        let other = ObjectKey::new(chunk(2), 7);
+        assert!(matches!(
+            store.get_chunk(entry, other).await,
+            Err(DiskError::Corrupt)
+        ));
+        assert_eq!(store.mismatches(), 1);
+        // Another identity: the key changed hands, a plain miss.
+        let foreign = ObjectKey::new(chunk(1), 8);
+        assert!(matches!(
+            store.get_chunk(entry, foreign).await,
+            Err(DiskError::Foreign)
+        ));
+        assert_eq!(store.mismatches(), 1);
+        // An entry no object is named for.
+        assert!(matches!(
+            store.get_chunk(batch(chunk(1), 5), key).await,
+            Err(DiskError::NotFound)
+        ));
+
+        // The object is the file's first extent: its header at offset 0,
+        // the payload length at 24, the payload from 64.
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(&u64::MAX.to_le_bytes(), 24).unwrap();
+        assert!(matches!(
+            store.get_chunk(entry, key).await,
+            Err(DiskError::Corrupt)
+        ));
+        assert_eq!(store.mismatches(), 2);
+
+        let (_dir, path, store) = mounted(1 << 20);
+        store
+            .put_chunk(key, batches(chunk(1), 2, 100))
+            .await
+            .unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all_at(&[0xEE], Header::LEN as u64 + 200)
+            .unwrap();
+        assert!(matches!(
+            store.get_chunk(entry, key).await,
+            Err(DiskError::Corrupt)
+        ));
+        assert_eq!(store.mismatches(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_full_store_refuses_a_put_and_keeps_what_it_held() {
+        let (_dir, _, store) = mounted(2 * PAGE);
+        let key = ObjectKey::new(chunk(1), 7);
+        store
+            .put_chunk(key, batches(chunk(1), 1, 100))
+            .await
+            .unwrap();
+        // Three pages do not fit the one page left.
+        let big = ObjectKey::new(chunk(2), 7);
+        assert!(matches!(
+            store
+                .put_chunk(big, batches(chunk(2), 1, 2 * PAGE as usize))
+                .await,
+            Err(DiskError::Full)
+        ));
+        assert_eq!(store.used_bytes(), PAGE);
+        assert_eq!(store.len(), 1);
+        assert!(store.get_chunk(batch(chunk(1), 0), key).await.is_ok());
+    }
+
+    #[test]
+    fn a_payload_that_is_not_a_directory_is_corrupt() {
+        for payload in [
+            &[][..],
+            &[1, 0, 0, 0][..],
+            &[0xFF; 64][..],
+            // One batch claimed, its range past the payload's end.
+            &[
+                1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0,
+                0, 0, 0, 0, 0, 0xFF, 0, 0, 0, 0, 0, 0, 0,
+            ][..],
+        ] {
+            assert!(matches!(Directory::read(payload), Err(DiskError::Corrupt)));
+        }
     }
 }
