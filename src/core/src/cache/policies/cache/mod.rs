@@ -3,10 +3,20 @@
 use crate::cache::cached_batch::CachedBatchType;
 use crate::cache::utils::EntryID;
 
-mod doubly_linked_list;
 mod three_queue;
 
 pub use three_queue::LiquidPolicy;
+
+/// How many column chunks a policy holds, by the queue each waits in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ChunkCounts {
+    /// Chunks in memory holding at least one Arrow batch.
+    pub memory_arrow: usize,
+    /// Chunks in memory holding only Liquid batches.
+    pub memory_liquid: usize,
+    /// Chunks on disk.
+    pub disk: usize,
+}
 
 /// The cache policy that guides the replacement of LiquidCache
 pub trait CachePolicy: std::fmt::Debug + Send + Sync {
@@ -22,6 +32,9 @@ pub trait CachePolicy: std::fmt::Debug + Send + Sync {
     ///
     /// The cache can tell the policy of the same key again, in any order
     /// with other notices of it, so this must file the key once (an upsert).
+    /// It tells the policy of the records of a chunk it wrote to disk while
+    /// holding that chunk's disk lock, so this must not wait on a cache
+    /// operation.
     fn notify_insert(&self, _entry_id: &EntryID, _batch_type: CachedBatchType) {}
 
     /// Notify the cache policy that an entry was accessed.
@@ -32,6 +45,18 @@ pub trait CachePolicy: std::fmt::Debug + Send + Sync {
     /// The cache can call this while holding a lock on the entry's disk
     /// object, so an implementation must not wait on a cache operation here.
     fn notify_remove(&self, _entry_id: &EntryID) {}
+
+    /// The cache tells the policy, once and before any notice, that the low
+    /// `batch_bits` bits of an entry id number a batch within its column
+    /// chunk, so entries agreeing above them are one chunk. A policy that
+    /// evicts by chunk hands out all of a chunk's batches in a tier together.
+    fn group_by_chunk(&self, _batch_bits: u32) {}
+
+    /// How many chunks the policy holds, by queue, kept as it goes. A policy
+    /// that does not group by chunk reports none.
+    fn chunk_counts(&self) -> ChunkCounts {
+        ChunkCounts::default()
+    }
 }
 
 #[cfg(test)]
