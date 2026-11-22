@@ -154,3 +154,102 @@ async fn a_failed_write_drops_the_chunk_and_gives_its_disk_back() {
     let held = cache.get(&entry(2, 1), 0).read().await.unwrap();
     assert_eq!(held.as_ref(), array(21).as_ref());
 }
+
+/// A store whose real file fails every write with `ENOSPC` while `writes`
+/// is set, and every read with `EIO` while `reads` is.
+fn faulty_store(
+    directory: &std::path::Path,
+) -> (
+    DiskStore,
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    use crate::cache::{DiskFile, FileIo};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug)]
+    struct Faulty {
+        file: FileIo,
+        writes: Arc<AtomicBool>,
+        reads: Arc<AtomicBool>,
+    }
+
+    fn fail(flag: &AtomicBool, code: i32) -> std::io::Result<()> {
+        match flag.load(Ordering::Relaxed) {
+            true => Err(std::io::Error::from_raw_os_error(code)),
+            false => Ok(()),
+        }
+    }
+
+    impl DiskFile for Faulty {
+        fn read_exact_at(&self, buffer: &mut [u8], at: u64) -> std::io::Result<()> {
+            fail(&self.reads, libc::EIO)?;
+            self.file.read_exact_at(buffer, at)
+        }
+
+        fn write_all_at(&self, buffer: &[u8], at: u64) -> std::io::Result<()> {
+            fail(&self.writes, libc::ENOSPC)?;
+            self.file.write_all_at(buffer, at)
+        }
+
+        fn sync(&self, at: u64, len: u64) -> std::io::Result<()> {
+            self.file.sync(at, len)
+        }
+    }
+
+    let (writes, reads) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (w, r) = (Arc::clone(&writes), Arc::clone(&reads));
+    let options = DiskOptions::new(1 << 20).with_file(move |file| {
+        Arc::new(Faulty {
+            file,
+            writes: Arc::clone(&w),
+            reads: Arc::clone(&r),
+        })
+    });
+    let store = DiskStore::mount(directory.join("tier.disk"), options).unwrap();
+    (store, writes, reads)
+}
+
+#[tokio::test]
+async fn an_injected_disk_fault_takes_a_real_fault_s_path() {
+    use std::sync::atomic::Ordering;
+    let directory = tempfile::tempdir().unwrap();
+    let (store, writes, reads) = faulty_store(directory.path());
+    let cache = cache(1 << 30, Some(store.clone())).await;
+
+    // ENOSPC on the spill: the chunk is dropped and its disk given back.
+    writes.store(true, Ordering::Relaxed);
+    insert_chunk(&cache, 1).await;
+    cache.insert(entry(2, 0), 0, array(20)).await.unwrap();
+    assert_eq!(tiers(&cache, 1), vec![None; BATCHES]);
+    assert_eq!(cache.stats().runtime.disk_write_failures, 1);
+    assert_eq!(cache.stats().disk_usage_bytes, 0);
+    assert!(store.is_empty());
+    writes.store(false, Ordering::Relaxed);
+
+    // EIO on a read of a spilled chunk: a miss, counted, and the chunk's
+    // record dropped; the process and the cache go on.
+    let directory = tempfile::tempdir().unwrap();
+    let (store, _, reads) = faulty_store(directory.path());
+    let cache = self::cache(1 << 30, Some(store)).await;
+    insert_chunk(&cache, 1).await;
+    cache.insert(entry(2, 0), 0, array(20)).await.unwrap();
+    assert_eq!(tiers(&cache, 1), vec![Some(true); BATCHES]);
+    let (spilled, on_disk) = (1, 1);
+    reads.store(true, Ordering::Relaxed);
+    assert!(
+        cache
+            .read_chunk(&entry(spilled, on_disk), 0)
+            .await
+            .is_empty()
+    );
+    assert_eq!(cache.stats().runtime.disk_read_failures, 1);
+    assert!(!cache.contains(&entry(spilled, on_disk), 0));
+    reads.store(false, Ordering::Relaxed);
+    cache.insert(entry(4, 0), 0, array(40)).await.unwrap();
+    let held = cache.get(&entry(4, 0), 0).read().await.unwrap();
+    assert_eq!(held.as_ref(), array(40).as_ref());
+}

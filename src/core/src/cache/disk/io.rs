@@ -1,7 +1,10 @@
-//! The store's I/O threads, and the page-aligned buffers they read and write.
+//! The store's file and its I/O threads, and the page-aligned buffers they
+//! read and write.
 
 use std::fs::File;
 use std::ops::Range;
+use std::os::unix::fs::FileExt;
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 
 use bytes::Bytes;
@@ -10,6 +13,88 @@ use super::DiskError;
 use super::extents::PAGE;
 
 type Job = Box<dyn FnOnce() + Send>;
+
+/// The positioned I/O a [`super::DiskStore`] does on its file, and nothing
+/// else: every read and write of an object goes through it, on the store's
+/// I/O threads.
+///
+/// [`FileIo`] is the store's real file and what [`super::DiskOptions`] mounts
+/// by default; [`super::DiskOptions::with_file`] puts another implementation
+/// in front of it. Whatever error an implementation returns takes the path a
+/// failing `pread`, `pwrite` or writeback of the real file takes
+/// ([`super::DiskError::Io`]), so an implementation that returns `EIO` or
+/// `ENOSPC` exercises exactly what a failing disk does.
+pub trait DiskFile: Send + Sync + std::fmt::Debug {
+    /// Fill `buffer` from the file's bytes at `at`, wholly or fail.
+    fn read_exact_at(&self, buffer: &mut [u8], at: u64) -> std::io::Result<()>;
+
+    /// Write all of `buffer` into the file at `at`, or fail.
+    fn write_all_at(&self, buffer: &[u8], at: u64) -> std::io::Result<()>;
+
+    /// Called once each object's write of `len` bytes at `at` has succeeded,
+    /// before the object is named: settle the write. Not a durability
+    /// barrier; see [`FileIo`].
+    fn sync(&self, at: u64, len: u64) -> std::io::Result<()>;
+}
+
+/// The store's real file: `pread` and `pwrite` on one descriptor.
+///
+/// Its [`DiskFile::sync`] writes a buffered write's dirty pages back and
+/// drops them from the page cache (Linux only), so a write leaves nothing
+/// cached; under direct I/O it does nothing. No metadata is synced: the
+/// store is emptied at every start.
+#[derive(Debug)]
+pub struct FileIo {
+    file: File,
+    direct: bool,
+}
+
+impl FileIo {
+    /// Open the file at `path`, creating it or discarding what it held:
+    /// `O_DIRECT` on Linux and `F_NOCACHE` on macOS when `direct`.
+    pub fn open(path: &Path, direct: bool) -> std::io::Result<Self> {
+        let mut open = std::fs::OpenOptions::new();
+        open.read(true).write(true).create(true).truncate(true);
+        #[cfg(target_os = "linux")]
+        if direct {
+            use std::os::unix::fs::OpenOptionsExt;
+            open.custom_flags(libc::O_DIRECT);
+        }
+        let file = open.open(path)?;
+        #[cfg(target_os = "macos")]
+        if direct {
+            use std::os::fd::AsRawFd;
+            // SAFETY: `file` was just opened, so its descriptor is valid, and
+            // the call reads no memory of this process.
+            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(Self { file, direct })
+    }
+
+    /// Set the file's length: sparse, so it takes no blocks until written.
+    pub(super) fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.file.set_len(len)
+    }
+}
+
+impl DiskFile for FileIo {
+    fn read_exact_at(&self, buffer: &mut [u8], at: u64) -> std::io::Result<()> {
+        self.file.read_exact_at(buffer, at)
+    }
+
+    fn write_all_at(&self, buffer: &[u8], at: u64) -> std::io::Result<()> {
+        self.file.write_all_at(buffer, at)
+    }
+
+    fn sync(&self, at: u64, len: u64) -> std::io::Result<()> {
+        if self.direct {
+            return Ok(());
+        }
+        drop_written_pages(&self.file, at, len)
+    }
+}
 
 /// A fixed set of threads that run the store's `pread`s and `pwrite`s.
 ///
@@ -111,7 +196,7 @@ impl PageBuffer {
 /// writeback but is not a durability barrier: no metadata is synced, and the
 /// store is emptied at every start anyway.
 #[cfg(target_os = "linux")]
-pub(super) fn drop_written_pages(file: &File, at: u64, len: u64) -> std::io::Result<()> {
+fn drop_written_pages(file: &File, at: u64, len: u64) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     let (Ok(offset), Ok(length)) = (libc::off64_t::try_from(at), libc::off64_t::try_from(len))
     else {
@@ -135,6 +220,6 @@ pub(super) fn drop_written_pages(file: &File, at: u64, len: u64) -> std::io::Res
 /// Elsewhere there is no portable way to drop written pages; buffered writes
 /// stay cached. Only Linux serves the tier.
 #[cfg(not(target_os = "linux"))]
-pub(super) fn drop_written_pages(_file: &File, _at: u64, _len: u64) -> std::io::Result<()> {
+fn drop_written_pages(_file: &File, _at: u64, _len: u64) -> std::io::Result<()> {
     Ok(())
 }

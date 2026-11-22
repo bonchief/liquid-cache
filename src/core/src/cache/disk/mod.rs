@@ -24,9 +24,7 @@ mod chunk;
 mod extents;
 mod io;
 
-use std::fs::File;
 use std::ops::Range;
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -35,6 +33,7 @@ use crate::cache::utils::EntryID;
 use chunk::Directory;
 pub use chunk::{ChunkObject, StoredBatch};
 use extents::{Extents, PAGE};
+pub use io::{DiskFile, FileIo};
 use io::{PageBuffer, Pool};
 
 /// What a [`DiskStore`] operation can fail with.
@@ -86,12 +85,27 @@ impl From<std::io::Error> for DiskError {
     }
 }
 
+/// What [`DiskOptions::with_file`] puts in front of the real file.
+type Layer = Arc<dyn Fn(FileIo) -> Arc<dyn DiskFile> + Send + Sync>;
+
 /// How a [`DiskStore`] is mounted.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
 pub struct DiskOptions {
     capacity: u64,
     direct: bool,
     threads: usize,
+    layer: Option<Layer>,
+}
+
+impl std::fmt::Debug for DiskOptions {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("DiskOptions")
+            .field("capacity", &self.capacity)
+            .field("direct", &self.direct)
+            .field("threads", &self.threads)
+            .field("layered", &self.layer.is_some())
+            .finish()
+    }
 }
 
 impl DiskOptions {
@@ -105,6 +119,7 @@ impl DiskOptions {
             capacity,
             direct: false,
             threads: 4,
+            layer: None,
         }
     }
 
@@ -120,6 +135,20 @@ impl DiskOptions {
     /// The most reads and writes in flight at once.
     pub fn with_threads(mut self, threads: usize) -> Self {
         self.threads = threads.max(1);
+        self
+    }
+
+    /// Do the store's I/O through what `layer` makes of the real file, once
+    /// it is opened and sized, instead of through the file itself. The
+    /// store's every read, write and [`DiskFile::sync`] then goes through
+    /// it, so an implementation that wraps the file and fails some calls
+    /// drives the store's own error paths. Without it the store uses the
+    /// [`FileIo`] as it is.
+    pub fn with_file(
+        mut self,
+        layer: impl Fn(FileIo) -> Arc<dyn DiskFile> + Send + Sync + 'static,
+    ) -> Self {
+        self.layer = Some(Arc::new(layer));
         self
     }
 }
@@ -182,8 +211,7 @@ pub struct DiskStore {
 
 #[derive(Debug)]
 struct Shared {
-    file: File,
-    direct: bool,
+    file: Arc<dyn DiskFile>,
     extents: Mutex<Extents>,
     mismatches: AtomicU64,
 }
@@ -192,14 +220,17 @@ impl DiskStore {
     /// Mount an empty store at `path`, creating the file or discarding what
     /// it held.
     pub fn mount(path: impl AsRef<Path>, options: DiskOptions) -> Result<Self, DiskError> {
-        let file = Shared::open(path.as_ref(), options.direct)?;
+        let file = FileIo::open(path.as_ref(), options.direct)?;
         let extents = Extents::new(options.capacity);
         file.set_len(extents.capacity())?;
+        let file: Arc<dyn DiskFile> = match &options.layer {
+            Some(layer) => layer(file),
+            None => Arc::new(file),
+        };
         let pool = Pool::start(options.threads)?;
         Ok(Self {
             shared: Arc::new(Shared {
                 file,
-                direct: options.direct,
                 extents: Mutex::new(extents),
                 mismatches: AtomicU64::new(0),
             }),
@@ -336,29 +367,6 @@ impl DiskStore {
 }
 
 impl Shared {
-    fn open(path: &Path, direct: bool) -> Result<File, DiskError> {
-        let mut open = std::fs::OpenOptions::new();
-        open.read(true).write(true).create(true).truncate(true);
-        #[cfg(target_os = "linux")]
-        if direct {
-            use std::os::unix::fs::OpenOptionsExt;
-            open.custom_flags(libc::O_DIRECT);
-        }
-        let file = open.open(path)?;
-        #[cfg(target_os = "macos")]
-        if direct {
-            use std::os::fd::AsRawFd;
-            // SAFETY: `file` was just opened, so its descriptor is valid, and
-            // the call reads no memory of this process.
-            if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1) } == -1 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let _ = direct;
-        Ok(file)
-    }
-
     fn extents(&self) -> MutexGuard<'_, Extents> {
         self.extents.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -382,9 +390,7 @@ impl Shared {
         let payload = body.get(..payload).ok_or(DiskError::Full)?;
         Header::of(key, payload).write(head);
         self.file.write_all_at(buffer.as_slice(), at)?;
-        if !self.direct {
-            io::drop_written_pages(&self.file, at, len as u64)?;
-        }
+        self.file.sync(at, len as u64)?;
         Ok(())
     }
 
@@ -508,6 +514,50 @@ impl Header {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use std::os::unix::fs::FileExt;
+    use std::sync::atomic::AtomicBool;
+
+    /// Which calls of a [`Faulty`] file fail.
+    #[derive(Debug, Default)]
+    struct Faults {
+        writes: AtomicBool,
+        syncs: AtomicBool,
+        reads: AtomicBool,
+    }
+
+    /// The real file, failing the calls `faults` names: writes with
+    /// `ENOSPC`, syncs and reads with `EIO`.
+    #[derive(Debug)]
+    struct Faulty {
+        file: FileIo,
+        faults: Arc<Faults>,
+    }
+
+    impl Faulty {
+        fn fail(flag: &AtomicBool, code: i32) -> std::io::Result<()> {
+            match flag.load(Ordering::Relaxed) {
+                true => Err(std::io::Error::from_raw_os_error(code)),
+                false => Ok(()),
+            }
+        }
+    }
+
+    impl DiskFile for Faulty {
+        fn read_exact_at(&self, buffer: &mut [u8], at: u64) -> std::io::Result<()> {
+            Self::fail(&self.faults.reads, libc::EIO)?;
+            self.file.read_exact_at(buffer, at)
+        }
+
+        fn write_all_at(&self, buffer: &[u8], at: u64) -> std::io::Result<()> {
+            Self::fail(&self.faults.writes, libc::ENOSPC)?;
+            self.file.write_all_at(buffer, at)
+        }
+
+        fn sync(&self, at: u64, len: u64) -> std::io::Result<()> {
+            Self::fail(&self.faults.syncs, libc::EIO)?;
+            self.file.sync(at, len)
+        }
+    }
 
     /// The first entry of chunk `chunk`, with 16 batch bits as the Parquet
     /// layer packs them.
@@ -646,6 +696,53 @@ mod tests {
             Err(DiskError::Corrupt)
         ));
         assert_eq!(store.mismatches(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_file_fails_the_call_and_keeps_what_the_store_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let faults = Arc::new(Faults::default());
+        let layered = Arc::clone(&faults);
+        let options = DiskOptions::new(1 << 20).with_file(move |file| {
+            Arc::new(Faulty {
+                file,
+                faults: Arc::clone(&layered),
+            })
+        });
+        let store = DiskStore::mount(dir.path().join("tier.disk"), options).unwrap();
+        let key = ObjectKey::new(chunk(1), 7);
+        let entry = batch(chunk(1), 0);
+        store
+            .put_chunk(key, batches(chunk(1), 2, 100))
+            .await
+            .unwrap();
+
+        // A write or its sync that fails names nothing and frees its extent.
+        for flag in [&faults.writes, &faults.syncs] {
+            flag.store(true, Ordering::Relaxed);
+            let other = ObjectKey::new(chunk(2), 7);
+            let put = store.put_chunk(other, batches(chunk(2), 1, 100)).await;
+            assert!(matches!(put, Err(DiskError::Io(_))), "{put:?}");
+            flag.store(false, Ordering::Relaxed);
+            assert_eq!(store.len(), 2);
+            assert_eq!(store.used_bytes(), PAGE);
+        }
+        let error = store
+            .put_chunk(key, batches(chunk(1), 2, 100))
+            .await
+            .map(|_| ());
+        assert!(error.is_ok());
+
+        // A read that fails is an I/O error, not a mismatch.
+        faults.reads.store(true, Ordering::Relaxed);
+        let read = store.get_chunk(entry, key).await;
+        match read {
+            Err(DiskError::Io(error)) => assert_eq!(error.raw_os_error(), Some(libc::EIO)),
+            other => panic!("expected EIO, got {:?}", other.map(|_| ())),
+        }
+        assert_eq!(store.mismatches(), 0);
+        faults.reads.store(false, Ordering::Relaxed);
+        assert!(store.get_chunk(entry, key).await.is_ok());
     }
 
     #[tokio::test]

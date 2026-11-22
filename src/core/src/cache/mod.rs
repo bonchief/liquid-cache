@@ -16,7 +16,9 @@ mod utils;
 pub use builders::{EvaluatePredicate, Get, Insert, LiquidCacheBuilder, default_max_memory_bytes};
 pub use cached_batch::{CacheEntry, CachedBatchType};
 pub use core::{FormHoldings, LiquidCache, PrefetchResult, TierCounters};
-pub use disk::{ChunkObject, DiskError, DiskOptions, DiskStore, ObjectKey, StoredBatch};
+pub use disk::{
+    ChunkObject, DiskError, DiskFile, DiskOptions, DiskStore, FileIo, ObjectKey, StoredBatch,
+};
 pub use expressions::{CacheExpression, Date32Field, VariantRequest};
 pub use io_context::{DefaultCacheMetadata, EntryMetadata};
 pub use liquid_expr::LiquidExpr;
