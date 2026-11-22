@@ -865,6 +865,102 @@ mod tests {
         spill.await.unwrap().unwrap();
     }
 
+    /// The real file, whose reads wait until `open` is set.
+    #[derive(Debug)]
+    struct SlowRead {
+        file: FileIo,
+        open: Arc<AtomicBool>,
+        reading: Arc<AtomicBool>,
+    }
+
+    impl DiskFile for SlowRead {
+        fn read_exact_at(&self, buffer: &mut [u8], at: u64) -> std::io::Result<()> {
+            self.reading.store(true, Ordering::Release);
+            while !self.open.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            self.file.read_exact_at(buffer, at)
+        }
+
+        fn write_all_at(&self, buffer: &[u8], at: u64) -> std::io::Result<()> {
+            self.file.write_all_at(buffer, at)
+        }
+
+        fn sync(&self, at: u64, len: u64) -> std::io::Result<()> {
+            self.file.sync(at, len)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_read_keeps_its_extent_until_its_pread_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (open, reading) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let (gate, seen) = (Arc::clone(&open), Arc::clone(&reading));
+        let options = DiskOptions::new(2 * PAGE).with_file(move |file| {
+            Arc::new(SlowRead {
+                file,
+                open: Arc::clone(&gate),
+                reading: Arc::clone(&seen),
+            })
+        });
+        let store = DiskStore::mount(dir.path().join("tier.disk"), options).unwrap();
+        let first = ObjectKey::new(chunk(1), 7);
+        store
+            .put_chunk(first, batches(chunk(1), 1, 100))
+            .await
+            .unwrap();
+
+        // A read starts its pread, then its caller drops it.
+        let pinned = store.clone();
+        let read = tokio::spawn(async move { pinned.get_chunk(batch(chunk(1), 0), first).await });
+        for _ in 0..1_000_000 {
+            if reading.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            reading.load(Ordering::Acquire),
+            "the read never reached its pread"
+        );
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+        assert!(store.remove(&batch(chunk(1), 0)));
+
+        // Puts race the read: the one free page goes, the pinned one never.
+        let second = ObjectKey::new(chunk(2), 7);
+        store
+            .put_chunk(second, batches(chunk(2), 1, 100))
+            .await
+            .unwrap();
+        let third = ObjectKey::new(chunk(3), 7);
+        assert!(matches!(
+            store.put_chunk(third, batches(chunk(3), 1, 100)).await,
+            Err(DiskError::Full)
+        ));
+        assert_eq!(store.used_bytes(), 2 * PAGE);
+
+        // Once the pread ends, the pin goes and the extent is free.
+        open.store(true, Ordering::Release);
+        for _ in 0..1_000_000 {
+            if store.used_bytes() == PAGE {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(store.used_bytes(), PAGE, "the dropped read's pin stayed");
+        store
+            .put_chunk(third, batches(chunk(3), 1, 100))
+            .await
+            .unwrap();
+        let object = store.get_chunk(batch(chunk(2), 0), second).await.unwrap();
+        let (_, _, bytes) = object.batches().next().unwrap();
+        assert_eq!(bytes, Bytes::from(vec![1; 100]));
+    }
+
     #[tokio::test]
     async fn a_full_store_refuses_a_put_and_keeps_what_it_held() {
         let (_dir, _, store) = mounted(2 * PAGE);
