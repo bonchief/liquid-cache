@@ -16,6 +16,11 @@ use crate::sync::RwLock;
 /// What the index holds for a key: the entry, and the identity of the source
 /// it was cached for.
 ///
+/// **An entry is found only under the identity it was inserted with.** Every
+/// lookup that serves data goes through [`ArtIndex::get_for`], which treats
+/// a slot of any other identity as absent, and every disk object carries the
+/// identity in its header, which a read checks.
+///
 /// A key does not name its source uniquely: callers pack fields into fixed
 /// widths, so two sources can compute the same key. The identity is what tells
 /// them apart, so a read under any other identity must treat the slot as
