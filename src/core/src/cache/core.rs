@@ -1907,8 +1907,9 @@ impl LiquidCache {
     ///
     /// The store returns an object only when its header names this entry's
     /// chunk and identity, its checksum matches and its directory lists the
-    /// entry. No object, or one another identity wrote since the key changed
-    /// hands, is a plain miss. An object that cannot be read, or does not
+    /// entry. No object is a plain miss; one another identity wrote since the
+    /// key changed hands is a miss that drops the record naming it, uncounted.
+    /// An object that cannot be read, or does not
     /// match its header, is a failure: it is counted, and the record naming
     /// it dropped so no later read tries it. The batch is copied out of the
     /// chunk's buffer, so an array decoded from it and kept in memory is
@@ -1933,7 +1934,14 @@ impl LiquidCache {
         let charge = |held: usize| self.reads.try_take(held.saturating_mul(2));
         match self.store.get_chunk_charged(*entry_id, key, charge).await {
             Ok(read) => Some(read),
-            Err(DiskError::NotFound | DiskError::Foreign | DiskError::Refused) => None,
+            Err(DiskError::NotFound | DiskError::Refused) => None,
+            // The object the record names is another identity's: the record
+            // can never be served, so it goes, and every later lookup for it
+            // (`holds_all` among them) misses rather than read and fall back.
+            Err(DiskError::Foreign) => {
+                self.drop_unreadable(*entry_id, identity).await;
+                None
+            }
             Err(error) => {
                 self.observer.on_disk_read_failure(&error);
                 drop(error);

@@ -322,3 +322,37 @@ async fn a_full_store_with_budget_to_spare_drops_disk_victims_and_retries() {
     let read = cache.read_chunk(&entry(2, 0), 0).await;
     assert_eq!(read.entries.len(), BATCHES);
 }
+
+#[tokio::test]
+async fn a_record_naming_another_identity_s_object_is_dropped() {
+    use crate::cache::{ObjectKey, StoredBatch};
+    let directory = tempfile::tempdir().unwrap();
+    let store = DiskStore::mount(
+        directory.path().join("tier.disk"),
+        DiskOptions::new(1 << 20),
+    )
+    .unwrap();
+    let cache = cache(1 << 30, Some(store.clone())).await;
+    insert_chunk(&cache, 1).await;
+    cache.insert(entry(2, 0), 0, array(20)).await.unwrap();
+    assert_eq!(tiers(&cache, 1), vec![Some(true); BATCHES]);
+
+    // Another identity's object now carries chunk 1's names.
+    let foreign = (0..BATCHES)
+        .map(|batch| StoredBatch::new(entry(1, batch), 0, bytes::Bytes::from_static(b"other")))
+        .collect();
+    store
+        .put_chunk(ObjectKey::new(entry(1, 0), 99), foreign)
+        .await
+        .unwrap();
+
+    let read = cache.read_chunk(&entry(1, 1), 0).await;
+    assert!(read.entries.is_empty());
+    assert!(!cache.contains(&entry(1, 1), 0), "the record goes");
+    assert_eq!(
+        cache.stats().runtime.disk_read_failures,
+        0,
+        "a miss, not a fault"
+    );
+    assert_eq!(store.mismatches(), 0);
+}
