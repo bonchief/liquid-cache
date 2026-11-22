@@ -10,6 +10,7 @@ repository = { workspace = true }
 [dependencies]
 arrow = { workspace = true }
 arrow-schema = { workspace = true }
+bytes = { workspace = true }
 parquet = { workspace = true }
 datafusion = { workspace = true }
 datafusion-datasource = { workspace = true }

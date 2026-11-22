@@ -115,6 +115,37 @@ impl CachedColumn {
         self.snapshots.get(&self.entry_id(batch_id).into())
     }
 
+    /// The entry this read holds for `batch_id`: its snapshot, or, when the
+    /// batch is on disk, the batch out of its chunk's object, read once for
+    /// the whole run. The read keeps the chunk's later batches as snapshots,
+    /// so the batches after this one are served from the same read buffer;
+    /// earlier ones were served already and are not kept. Nothing is
+    /// inserted into the cache.
+    pub(crate) async fn held_entry(&self, batch_id: BatchID) -> Option<Arc<CacheEntry>> {
+        let entry_id = self.entry_id(batch_id).into();
+        if let Some(entry) = self.snapshots.get(&entry_id) {
+            return Some(entry);
+        }
+        if !self.cache_store.is_on_disk(&entry_id, self.file_identity) {
+            return None;
+        }
+        let mut found = None;
+        for (id, entry) in self
+            .cache_store
+            .read_chunk(&entry_id, self.file_identity)
+            .await
+        {
+            let batch = ParquetArrayID::from(id).batch_id_inner();
+            if id == entry_id {
+                found = Some(Arc::clone(&entry));
+            }
+            if batch >= u64::from(*batch_id) {
+                self.snapshots.insert(id, entry);
+            }
+        }
+        found
+    }
+
     /// Returns the Arrow field metadata for this cached column.
     pub fn field(&self) -> Arc<Field> {
         self.field.clone()
@@ -125,9 +156,9 @@ impl CachedColumn {
         self.expression.clone()
     }
 
-    fn array_to_record_batch(&self, array: ArrayRef) -> RecordBatch {
+    fn array_to_record_batch(&self, array: ArrayRef) -> Result<RecordBatch, ArrowError> {
         let schema = Arc::new(Schema::new(vec![self.field.clone()]));
-        RecordBatch::try_new(schema, vec![array]).unwrap()
+        RecordBatch::try_new(schema, vec![array])
     }
 
     /// Evaluates a predicate on a cached column.
@@ -144,7 +175,7 @@ impl CachedColumn {
         );
 
         if let Some(liquid_expr) = liquid_expr
-            && let Some(boolean_array) = match self.snapshots.get(&entry_id) {
+            && let Some(boolean_array) = match self.held_entry(batch_id).await {
                 Some(entry) => {
                     self.cache_store
                         .eval_predicate_on_entry(
@@ -172,7 +203,10 @@ impl CachedColumn {
         }
 
         let array = self.get_arrow_array_with_filter(batch_id, filter).await?;
-        let record_batch = self.array_to_record_batch(array);
+        let record_batch = match self.array_to_record_batch(array) {
+            Ok(batch) => batch,
+            Err(err) => return Some(Err(err)),
+        };
         let boolean_array = match predicate.evaluate(record_batch) {
             Ok(arr) => arr,
             Err(err) => return Some(Err(err)),
@@ -205,7 +239,7 @@ impl CachedColumn {
         filter: &BooleanBuffer,
     ) -> Option<ArrayRef> {
         let entry_id = self.entry_id(batch_id).into();
-        if let Some(entry) = self.snapshots.get(&entry_id) {
+        if let Some(entry) = self.held_entry(batch_id).await {
             return self
                 .cache_store
                 .read_entry(
@@ -258,6 +292,14 @@ impl CachedColumn {
         let entry_id = self.entry_id(batch_id).into();
         if self.snapshots.get(&entry_id).is_some() {
             return PrefetchOutcome::AlreadySnapshotted;
+        }
+        // A batch on disk is read with its chunk, into this read's
+        // snapshots, never back into the cache.
+        if self.cache_store.is_on_disk(&entry_id, self.file_identity) {
+            return match self.held_entry(batch_id).await {
+                Some(_) => PrefetchOutcome::Snapshotted,
+                None => PrefetchOutcome::Missing,
+            };
         }
         match self
             .cache_store

@@ -21,17 +21,19 @@ use parquet::arrow::arrow_reader::ArrowPredicate;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 mod column;
+mod fill;
 mod id;
 mod registry;
 mod stats;
 
 pub use column::{CachedColumn, CachedColumnRef};
+pub use fill::{FillError, chunk_span};
 pub(crate) use column::{InsertArrowArrayError, PrefetchOutcome};
 pub(crate) use id::ColumnAccessPath;
-pub use id::{BatchID, ParquetArrayID};
+pub use id::{BATCH_BITS, BatchID, ParquetArrayID};
 use registry::{FileKey, FileLease, FileRegistry};
 
 /// Typed lineage expressions for a single file, keyed by file-schema column name.
@@ -321,7 +323,7 @@ impl CachedRowGroup {
 
                 for (col_name, expr) in column_exprs {
                     let column = self.get_column_by_name(col_name)?;
-                    let snapshot_liquid = match column.snapshot_entry(batch_id) {
+                    let snapshot_liquid = match column.held_entry(batch_id).await {
                         Some(entry) => match entry.as_ref() {
                             CacheEntry::MemoryLiquid(array) => Some(Arc::clone(array)),
                             _ => {
@@ -404,9 +406,11 @@ impl CachedRowGroup {
             fields.push(column.field());
         }
         let schema = Arc::new(Schema::new(fields));
-        let record_batch = RecordBatch::try_new(schema, arrays).unwrap();
-        let boolean_array = predicate.evaluate(record_batch).unwrap();
-        Some(Ok(boolean_array))
+        let record_batch = match RecordBatch::try_new(schema, arrays) {
+            Ok(batch) => batch,
+            Err(error) => return Some(Err(error)),
+        };
+        Some(predicate.evaluate(record_batch))
     }
 }
 
@@ -525,6 +529,31 @@ pub struct LiquidCacheParquet {
 
     /// Set while a sweep for forgettable files runs, so only one does.
     sweeping: AtomicBool,
+
+    fills: FillCounts,
+}
+
+/// How fills and reads that might have filled ended, counted as they end.
+#[derive(Debug, Default)]
+struct FillCounts {
+    done: AtomicU64,
+    refused: AtomicU64,
+    raced: AtomicU64,
+}
+
+/// What the cache holds per tier and form, how chunks moved, and how fills
+/// ended, from counters kept as they change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParquetTierCounters {
+    /// The core cache's counters.
+    pub cache: liquid_cache::cache::TierCounters,
+    /// Column chunks [`LiquidCacheParquet::fill`] inserted.
+    pub fills_done: u64,
+    /// Column chunks a fill could not decode, or the cache refused.
+    pub fills_refused: u64,
+    /// Batches a read with fill off found missing and read from Parquet
+    /// without inserting.
+    pub raced: u64,
 }
 
 /// A reference to the main cache structure.
@@ -579,6 +608,7 @@ impl LiquidCacheParquet {
             .with_metadata(Arc::clone(&metadata) as _)
             .with_store(store)
             .with_evict_victims_concurrently(evict_victims_concurrently)
+            .with_chunk_bits(BATCH_BITS)
             .build()
             .await;
 
@@ -587,6 +617,7 @@ impl LiquidCacheParquet {
             cache_store: cache_storage,
             metadata,
             sweeping: AtomicBool::new(false),
+            fills: FillCounts::default(),
         }
     }
 
@@ -642,6 +673,148 @@ impl LiquidCacheParquet {
             let id = path.entry_id(BatchID::from_raw(batch as u16));
             self.cache_store.contains(&id.into(), key.identity)
         })
+    }
+
+    /// Per row group in `row_groups` (its index, and its row count), whether
+    /// the cache holds every batch of every column in `columns` (their
+    /// indices in the file schema), in memory or on disk. Takes the registry
+    /// lock once; registers nothing, so a file the cache does not know holds
+    /// nothing.
+    pub fn holds_all(
+        &self,
+        file: &ParquetFileIdentity,
+        row_groups: &[(u64, usize)],
+        columns: &[u64],
+    ) -> Vec<bool> {
+        let Some(key) = self.files.lock().unwrap().key(file) else {
+            return vec![false; row_groups.len()];
+        };
+        let batches = |rows: usize| rows.div_ceil(self.batch_size());
+        row_groups
+            .iter()
+            .map(|&(row_group, rows)| {
+                columns.iter().all(|&column| {
+                    let path = ColumnAccessPath::new(key.slot as u64, row_group, column);
+                    (0..batches(rows)).all(|batch| {
+                        u16::try_from(batch).is_ok_and(|batch| {
+                            let id = path.entry_id(BatchID::from_raw(batch));
+                            self.cache_store.contains(&id.into(), key.identity)
+                        })
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// Insert column `column` (its index in the file's Arrow schema) of row
+    /// group `row_group` of `file`, whole, from `bytes`: the chunk's whole
+    /// span in the file ([`chunk_span`]), fetched by the caller.
+    ///
+    /// The bytes are decoded as a read decodes the file: with `metadata`,
+    /// the file's footer, and its Arrow schema coerced to `schema`, the
+    /// table's (views where the table reads views). Each batch is encoded on
+    /// the caller's thread, to Liquid where that is smaller, else Arrow, and
+    /// the chunk goes in whole or not at all. A chunk the cache holds whole
+    /// already is left as it is. Bad bytes are an error, never a panic.
+    /// Returns how many batches went in.
+    pub async fn fill(
+        &self,
+        file: ParquetFileIdentity,
+        schema: SchemaRef,
+        metadata: Arc<parquet::file::metadata::ParquetMetaData>,
+        row_group: usize,
+        column: usize,
+        bytes: bytes::Bytes,
+    ) -> Result<usize, FillError> {
+        let filled = self
+            .fill_chunk(file, schema, metadata, row_group, column, bytes)
+            .await;
+        let counter = match &filled {
+            Ok(_) => &self.fills.done,
+            Err(_) => &self.fills.refused,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        filled
+    }
+
+    async fn fill_chunk(
+        &self,
+        file: ParquetFileIdentity,
+        schema: SchemaRef,
+        metadata: Arc<parquet::file::metadata::ParquetMetaData>,
+        row_group: usize,
+        column: usize,
+        bytes: bytes::Bytes,
+    ) -> Result<usize, FillError> {
+        let reader = fill::reader_metadata(&schema, metadata).map_err(FillError::Decode)?;
+        let rows = reader
+            .metadata()
+            .row_groups()
+            .get(row_group)
+            .and_then(|group| usize::try_from(group.num_rows()).ok())
+            .ok_or(FillError::NoSuchChunk)?;
+        let (rg, col) = (
+            u64::try_from(row_group).map_err(|_| FillError::NoSuchChunk)?,
+            u64::try_from(column).map_err(|_| FillError::NoSuchChunk)?,
+        );
+        if rg > u64::from(u16::MAX) || col > u64::from(u16::MAX) {
+            return Err(FillError::NoSuchChunk);
+        }
+        // Registered under the schema a read registers it under, and held for
+        // the fill, so the file's slot is not handed on while it inserts.
+        let cached = self.register_or_get_file(file.clone(), Arc::clone(reader.schema()));
+        if self.holds_all(&file, &[(rg, rows)], &[col]) == [true] {
+            return Ok(0);
+        }
+        let arrays = fill::decode(&reader, row_group, column, bytes, self.batch_size())?;
+        let path = ColumnAccessPath::new(cached.key.slot as u64, rg, col);
+        let mut batches = Vec::with_capacity(arrays.len());
+        for (batch, array) in arrays.iter().enumerate() {
+            let batch = u16::try_from(batch).map_err(|_| FillError::NoSuchChunk)?;
+            let id = path.entry_id(BatchID::from_raw(batch));
+            batches.push((id.into(), LiquidCache::encode(array)));
+        }
+        let count = batches.len();
+        self.cache_store
+            .insert_chunk(cached.key.identity, batches)
+            .await
+            .map_err(|_| FillError::Full)?;
+        Ok(count)
+    }
+
+    /// Read column `column` of row group `row_group` of `file`, `rows` rows,
+    /// back from disk into memory, one read per chunk object: how many
+    /// batches went in. A read never does this; an owner that decides a
+    /// chunk is hot calls it. Registers nothing.
+    pub async fn promote(
+        &self,
+        file: &ParquetFileIdentity,
+        row_group: u64,
+        column: u64,
+        rows: usize,
+    ) -> usize {
+        let Some(key) = self.files.lock().unwrap().key(file) else {
+            return 0;
+        };
+        let entries = self.held_entries(file, row_group, column, rows);
+        self.cache_store.promote(&entries, key.identity).await
+    }
+
+    /// Count `batches` a read with fill off found missing and read from
+    /// Parquet without inserting.
+    pub(crate) fn count_raced(&self, batches: u64) {
+        self.fills.raced.fetch_add(batches, Ordering::Relaxed);
+    }
+
+    /// What the cache holds per tier and form, how chunks moved, and how
+    /// fills ended, from counters kept as they change.
+    pub fn counters(&self) -> ParquetTierCounters {
+        ParquetTierCounters {
+            cache: self.cache_store.counters(),
+            fills_done: self.fills.done.load(Ordering::Relaxed),
+            fills_refused: self.fills.refused.load(Ordering::Relaxed),
+            raced: self.fills.raced.load(Ordering::Relaxed),
+        }
     }
 
     /// The entries the cache holds of column `column` in row group

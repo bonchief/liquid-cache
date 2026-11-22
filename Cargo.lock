@@ -2785,6 +2785,7 @@ dependencies = [
  "ahash",
  "arrow",
  "arrow-schema",
+ "bytes",
  "datafusion",
  "datafusion-datasource",
  "divan",

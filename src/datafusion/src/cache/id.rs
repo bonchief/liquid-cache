@@ -2,6 +2,11 @@ use std::ops::Deref;
 
 use liquid_cache::cache::EntryID;
 
+/// The low bits of a [`ParquetArrayID`] that number a batch within its
+/// column chunk. Clearing them leaves the chunk: one column of one row group
+/// of one file, which the cache evicts, writes and reads whole.
+pub const BATCH_BITS: u32 = 16;
+
 /// This is a unique identifier for a row in a parquet file.
 #[repr(C, align(8))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
