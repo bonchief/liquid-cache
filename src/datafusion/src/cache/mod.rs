@@ -696,22 +696,58 @@ impl LiquidCacheParquet {
         row_groups: &[(u64, usize)],
         columns: &[u64],
     ) -> Vec<bool> {
+        self.held_groups(file, row_groups, columns)
+            .into_iter()
+            .map(|held| held.is_some())
+            .collect()
+    }
+
+    /// Per row group in `row_groups`, with the arguments of
+    /// [`Self::holds_all`], whether the cache holds every batch of every
+    /// column in `columns` and at least one of those batches is on disk: a
+    /// held read of that group would read the disk tier. Takes the registry
+    /// lock once; registers nothing.
+    pub fn held_on_disk(
+        &self,
+        file: &ParquetFileIdentity,
+        row_groups: &[(u64, usize)],
+        columns: &[u64],
+    ) -> Vec<bool> {
+        self.held_groups(file, row_groups, columns)
+            .into_iter()
+            .map(|held| held == Some(true))
+            .collect()
+    }
+
+    /// Per row group: `None` unless every batch of every asked column is
+    /// held, else whether any of them is on disk.
+    fn held_groups(
+        &self,
+        file: &ParquetFileIdentity,
+        row_groups: &[(u64, usize)],
+        columns: &[u64],
+    ) -> Vec<Option<bool>> {
         let Some(key) = self.files().key(file) else {
-            return vec![false; row_groups.len()];
+            return vec![None; row_groups.len()];
         };
         let batches = |rows: usize| rows.div_ceil(self.batch_size());
         row_groups
             .iter()
             .map(|&(row_group, rows)| {
-                columns.iter().all(|&column| {
+                let mut disk = false;
+                for &column in columns {
                     let path = ColumnAccessPath::new(key.slot as u64, row_group, column);
-                    (0..batches(rows)).all(|batch| {
-                        u16::try_from(batch).is_ok_and(|batch| {
-                            let id = path.entry_id(BatchID::from_raw(batch));
-                            self.cache_store.contains(&id.into(), key.identity)
-                        })
-                    })
-                })
+                    for batch in 0..batches(rows) {
+                        let id: EntryID = path
+                            .entry_id(BatchID::from_raw(u16::try_from(batch).ok()?))
+                            .into();
+                        if !self.cache_store.contains(&id, key.identity) {
+                            return None;
+                        }
+                        disk = disk || self.cache_store.is_on_disk(&id, key.identity);
+                    }
+                }
+                Some(disk)
             })
             .collect()
     }
@@ -1801,6 +1837,56 @@ mod fill_tests {
         // A chunk the cache holds whole already is left as it is.
         let again = fill(&cache, &metadata, 0, 0, chunk(&bytes, &metadata, 0, 0)).await;
         assert_eq!(again.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn held_on_disk_needs_a_whole_group_with_a_chunk_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path()).await;
+        let (bytes, metadata) = file();
+        let groups = [(0, ROWS), (1, ROWS)];
+        assert_eq!(
+            cache.held_on_disk(&identity(), &groups, &[0]),
+            [false, false]
+        );
+
+        fill(&cache, &metadata, 0, 0, chunk(&bytes, &metadata, 0, 0))
+            .await
+            .unwrap();
+        // Held in memory only.
+        assert_eq!(
+            cache.held_on_disk(&identity(), &groups, &[0]),
+            [false, false]
+        );
+
+        cache.flush_data().await.unwrap();
+        assert_eq!(
+            cache.held_on_disk(&identity(), &groups, &[0]),
+            [true, false]
+        );
+        // A group with a chunk on disk but another not held is not held.
+        assert_eq!(
+            cache.held_on_disk(&identity(), &groups, &[0, 1]),
+            [false, false]
+        );
+
+        // One asked chunk on disk, the other in memory: on disk.
+        fill(&cache, &metadata, 0, 1, chunk(&bytes, &metadata, 0, 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.storage().stats().memory_arrow_entries
+                + cache.storage().stats().memory_liquid_entries,
+            ROWS / BATCH
+        );
+        assert_eq!(
+            cache.held_on_disk(&identity(), &groups, &[1]),
+            [false, false]
+        );
+        assert_eq!(
+            cache.held_on_disk(&identity(), &groups, &[0, 1]),
+            [true, false]
+        );
     }
 
     #[tokio::test]
