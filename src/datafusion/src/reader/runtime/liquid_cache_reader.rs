@@ -726,6 +726,7 @@ mod tests {
             fallback: ParquetFallbackConfig {
                 row_group_idx: 0,
                 metadata: Arc::clone(reader_metadata.metadata()),
+                file_schema: Arc::clone(reader_metadata.schema()),
                 reader_factory,
                 cache_projection: projection,
                 cache_column_ids: vec![0],

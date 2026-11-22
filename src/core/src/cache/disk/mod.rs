@@ -31,8 +31,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use bytes::Bytes;
-
 use crate::cache::utils::EntryID;
 use chunk::Directory;
 pub use chunk::{ChunkObject, StoredBatch};

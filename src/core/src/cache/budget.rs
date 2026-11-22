@@ -176,6 +176,7 @@ impl BudgetAccounting {
 
     /// Adjust memory usage after transcoding.
     /// Returns ok if the usage was adjusted, err if the memory budget is full when new_size is larger than old_size.
+    #[cfg(test)]
     pub(super) fn try_update_memory_usage(
         &self,
         old_size: usize,

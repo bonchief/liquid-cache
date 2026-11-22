@@ -9,7 +9,7 @@ use datafusion::{
             ParquetFileMetrics, ParquetFileReaderFactory,
             parquet::{
                 BloomFilterStatistics, PagePruningAccessPlanFilter, ParquetAccessPlan,
-                RowGroupAccessPlanFilter,
+                RowGroupAccess, RowGroupAccessPlanFilter,
             },
         },
         table_schema::TableSchema,
@@ -656,18 +656,38 @@ fn plan_row_group_morsels(planned: PlannedRowGroups) -> Result<Option<MorselPlan
         on_miss,
     });
 
-    let row_group_indexes = access_plan.row_group_indexes();
     let row_group_metadata = metadata.row_groups();
-    let mut selection = access_plan.into_overall_row_selection(row_group_metadata)?;
-    let mut queue = VecDeque::with_capacity(row_group_indexes.len());
-    for row_group_idx in row_group_indexes {
-        let row_count = row_group_metadata[row_group_idx].num_rows() as usize;
-        let row_group_selection = selection
-            .as_mut()
-            .map(|selection| selection.split_off(row_count));
-        let row_group_selection = row_group_selection.unwrap_or_else(|| {
-            vec![parquet::arrow::arrow_reader::RowSelector::select(row_count)].into()
-        });
+    if access_plan.len() != row_group_metadata.len() {
+        return internal_err!(
+            "the access plan names {} row groups, the file has {}",
+            access_plan.len(),
+            row_group_metadata.len()
+        );
+    }
+    let mut queue = VecDeque::with_capacity(access_plan.len());
+    for (row_group_idx, (access, group)) in access_plan
+        .into_inner()
+        .into_iter()
+        .zip(row_group_metadata)
+        .enumerate()
+    {
+        let row_count = usize::try_from(group.num_rows()).unwrap_or(0);
+        let row_group_selection = match access {
+            RowGroupAccess::Skip => continue,
+            RowGroupAccess::Scan => {
+                vec![parquet::arrow::arrow_reader::RowSelector::select(row_count)].into()
+            }
+            RowGroupAccess::Selection(selection) => {
+                let rows: usize = selection.iter().map(|selector| selector.row_count).sum();
+                if rows != row_count {
+                    return internal_err!(
+                        "the access plan selects over {rows} rows of row group \
+                         {row_group_idx}, which has {row_count}"
+                    );
+                }
+                selection
+            }
+        };
         if row_group_selection.row_count() > 0 {
             queue.push_back((row_group_idx, row_group_selection));
         }

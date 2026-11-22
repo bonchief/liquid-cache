@@ -78,7 +78,7 @@ impl Extents {
     /// pinned once for the write that fills it. `None` when no free span
     /// below the capacity is that long.
     pub(super) fn allocate(&mut self, len: u64) -> Option<u64> {
-        if len == 0 || len % PAGE != 0 {
+        if len == 0 || !len.is_multiple_of(PAGE) {
             return None;
         }
         let at = match self.free.take(len) {

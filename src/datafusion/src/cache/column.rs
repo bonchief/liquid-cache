@@ -111,10 +111,6 @@ impl CachedColumn {
             .contains(&self.entry_id(batch_id).into(), self.file_identity)
     }
 
-    pub(crate) fn snapshot_entry(&self, batch_id: BatchID) -> Option<Arc<CacheEntry>> {
-        self.snapshots.get(&self.entry_id(batch_id).into())
-    }
-
     /// The entry this read holds for `batch_id`: its snapshot, or, when the
     /// batch is on disk, the batch out of its chunk's object, read once for
     /// the whole run. The read keeps the chunk's later batches as snapshots,
