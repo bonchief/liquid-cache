@@ -40,6 +40,7 @@ pub struct LiquidCacheBuilder {
     metadata: Option<Arc<dyn EntryMetadata>>,
     store: Option<DiskStore>,
     evict_victims_concurrently: bool,
+    chunk_bits: u32,
 }
 
 impl Default for LiquidCacheBuilder {
@@ -58,11 +59,12 @@ impl LiquidCacheBuilder {
             max_memory_bytes,
             max_disk_bytes,
             cache_policy: Box::new(LiquidPolicy::new()),
-            hydration_policy: Box::new(super::AlwaysHydrate::new()),
+            hydration_policy: Box::new(super::NoHydration::new()),
             eviction_policy: Box::new(TranscodeEvict),
             metadata: None,
             store: None,
             evict_victims_concurrently: !cfg!(test),
+            chunk_bits: 0,
         }
     }
 
@@ -125,6 +127,15 @@ impl LiquidCacheBuilder {
         self
     }
 
+    /// Treat the low `bits` of an entry id as its batch within a chunk: the
+    /// cache evicts, writes and reads a chunk's batches together, as one
+    /// policy record and one disk object. Default 0: every entry is its own
+    /// chunk.
+    pub fn with_chunk_bits(mut self, bits: u32) -> Self {
+        self.chunk_bits = bits;
+        self
+    }
+
     /// Set whether cache victims are evicted concurrently.
     pub fn with_evict_victims_concurrently(mut self, enabled: bool) -> Self {
         self.evict_victims_concurrently = enabled;
@@ -171,6 +182,7 @@ impl LiquidCacheBuilder {
             metadata,
             store,
             self.evict_victims_concurrently,
+            self.chunk_bits,
         ))
     }
 }
@@ -391,7 +403,7 @@ impl<'a> IntoFuture for Get<'a> {
 }
 
 /// Recursively garbage collects view arrays (BinaryView/StringView) within an array tree.
-fn maybe_gc_view_arrays(array: &ArrayRef) -> Option<ArrayRef> {
+pub(super) fn maybe_gc_view_arrays(array: &ArrayRef) -> Option<ArrayRef> {
     if let Some(binary_view) = array.as_any().downcast_ref::<BinaryViewArray>() {
         return Some(Arc::new(binary_view.gc()));
     }

@@ -18,16 +18,18 @@ pub enum CacheEntry {
     DiskLiquid {
         /// Original Arrow data type.
         data_type: DataType,
-        /// Byte length of the persisted payload, without the store's header
-        /// and padding.
+        /// The disk budget the record holds: its share of the extent its
+        /// object takes in the store. Callers building a record pass the
+        /// payload's length; the write that installs it sets its share.
         disk_bytes: usize,
     },
     /// Cached batch on disk as Arrow array.
     DiskArrow {
         /// Original Arrow data type.
         data_type: DataType,
-        /// Byte length of the persisted payload, without the store's header
-        /// and padding.
+        /// The disk budget the record holds: its share of the extent its
+        /// object takes in the store. Callers building a record pass the
+        /// payload's length; the write that installs it sets its share.
         disk_bytes: usize,
     },
 }
@@ -56,6 +58,22 @@ impl CacheEntry {
         Self::DiskArrow {
             data_type,
             disk_bytes,
+        }
+    }
+
+    /// This record holding `bytes` of the disk budget; a memory entry is
+    /// returned as it is.
+    pub(crate) fn charged_at(self, bytes: usize) -> Self {
+        match self {
+            Self::DiskLiquid { data_type, .. } => Self::DiskLiquid {
+                data_type,
+                disk_bytes: bytes,
+            },
+            Self::DiskArrow { data_type, .. } => Self::DiskArrow {
+                data_type,
+                disk_bytes: bytes,
+            },
+            memory @ (Self::MemoryArrow(_) | Self::MemoryLiquid(_)) => memory,
         }
     }
 

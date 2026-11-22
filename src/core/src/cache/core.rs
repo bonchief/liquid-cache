@@ -10,7 +10,7 @@ use super::{
     budget::BudgetAccounting,
     builders::{EvaluatePredicate, Get, Insert},
     cached_batch::{CacheEntry, CachedBatchType},
-    disk::{DiskError, DiskStore, ObjectKey},
+    disk::{DiskError, DiskStore, ObjectKey, StoredBatch},
     io_context::EntryMetadata,
     observer::{CacheTracer, InternalEvent, Observer},
     policies::{CachePolicy, HydrationPolicy, HydrationRequest, MaterializedEntry},
@@ -69,6 +69,10 @@ pub struct LiquidCache {
     disk_key_locks: DiskKeyLocks,
     stray_objects: StrayObjects,
     evict_victims_concurrently: bool,
+    /// Clears an entry id's batch bits, leaving its chunk (see
+    /// [`Self::chunk_of`]).
+    chunk_mask: usize,
+    events: TierEvents,
     /// The bounds on transcoding inserted byte arrays to Liquid in the
     /// background, once turned on ([`Self::transcode_text_in_background`]).
     background_text: std::sync::OnceLock<Transcodes>,
@@ -85,20 +89,23 @@ pub(crate) struct Transcodes {
     pub(crate) taken: Arc<tokio::sync::Semaphore>,
 }
 
-/// Orders the store operations on one key.
+/// Orders the store operations on one chunk's keys.
 ///
-/// Objects are keyed by entry id alone, so every write of a key lands on the
-/// object the previous one left. A write puts the object and then installs the
-/// record naming it; a reclaim checks that no record names the object and then
-/// deletes it. Unordered, a reclaim can check after a newer write's put and
-/// before its install, and delete the object that record is about to name.
-/// So a write holds its key's lock from the put through the install, and a
-/// reclaim from the check through the delete.
+/// Each entry names at most one object, so every write of a key replaces the
+/// name the previous one left. A write puts the object and then installs the
+/// records naming it; a reclaim checks that no record names the object and
+/// then deletes the name. Unordered, a reclaim can check after a newer
+/// write's put and before its install, and delete the name that record is
+/// about to rely on. So a write holds its chunk's lock from the put through
+/// the install of every record it names, and a reclaim from the check
+/// through the delete. A lock covers a whole chunk (an entry id with its
+/// batch bits cleared), so one write can name all of a chunk's batches.
 ///
-/// Keys share a fixed set of locks. Nothing holds one while taking another.
+/// Chunks share a fixed set of locks. Nothing holds one while taking another.
 #[derive(Debug)]
 struct DiskKeyLocks {
     locks: Box<[futures::lock::Mutex<()>]>,
+    chunk_mask: usize,
 }
 
 /// A held [`DiskKeyLocks`] lock.
@@ -107,22 +114,26 @@ type DiskKeyGuard<'a> = futures::lock::MutexGuard<'a, ()>;
 impl DiskKeyLocks {
     const LOCKS: usize = 256;
 
-    fn new() -> Self {
+    fn new(chunk_mask: usize) -> Self {
         Self {
             locks: (0..Self::LOCKS)
                 .map(|_| futures::lock::Mutex::new(()))
                 .collect(),
+            chunk_mask,
         }
     }
 
+    /// The lock of `entry_id`'s chunk.
     async fn lock(&self, entry_id: &EntryID) -> DiskKeyGuard<'_> {
-        self.locks[Self::lock_of(entry_id)].lock().await
+        // `lock_of` is below `LOCKS`, the slice's length.
+        self.locks[self.lock_of(entry_id)].lock().await
     }
 
-    fn lock_of(entry_id: &EntryID) -> usize {
+    fn lock_of(&self, entry_id: &EntryID) -> usize {
         // Callers pack fields into entry ids, so mix the bits rather than let
         // one field pick the lock.
-        let mixed = (usize::from(*entry_id) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let chunk = usize::from(*entry_id) & self.chunk_mask;
+        let mixed = (chunk as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         (mixed >> 56) as usize % Self::LOCKS
     }
 }
@@ -140,10 +151,28 @@ struct DiskCharge<'a> {
     bytes: usize,
 }
 
-impl DiskCharge<'_> {
+impl<'a> DiskCharge<'a> {
     /// Leave the charge held, by the record now naming the object.
     fn pass_to_record(self) {
         std::mem::forget(self);
+    }
+
+    /// The charge cut into `parts` shares that sum to it exactly: equal ones,
+    /// the first also taking the remainder. Nothing is released or charged
+    /// twice; with no parts the whole charge is released.
+    fn split(self, parts: usize) -> Vec<DiskCharge<'a>> {
+        let Some(base) = self.bytes.checked_div(parts) else {
+            return Vec::new();
+        };
+        let remainder = self.bytes - base * parts;
+        let budget = self.budget;
+        std::mem::forget(self);
+        (0..parts)
+            .map(|part| DiskCharge {
+                budget,
+                bytes: if part == 0 { base + remainder } else { base },
+            })
+            .collect()
     }
 }
 
@@ -153,14 +182,105 @@ impl Drop for DiskCharge<'_> {
     }
 }
 
-/// An object put in the store whose record is not installed yet: its key's
-/// lock (see [`DiskKeyLocks`]) and its charge. Installing the record releases
-/// the lock and passes the charge to the record; dropping it releases both,
-/// and leaves the object for [`StrayObjects`].
+/// An object put in the store whose record is not installed yet: its
+/// chunk's lock (see [`DiskKeyLocks`]), unless a [`ChunkWrite`] holds it for
+/// all its batches, and the batch's share of the object's charge. Installing
+/// the record releases the lock it holds and passes the charge to the record;
+/// dropping it releases both, and leaves the name for [`StrayObjects`].
 struct DiskWrite<'a> {
-    key_lock: DiskKeyGuard<'a>,
+    key_lock: Option<DiskKeyGuard<'a>>,
     charge: DiskCharge<'a>,
     unnamed: UnfinishedObject<'a>,
+}
+
+/// One object written for several batches of a chunk: the chunk's lock, held
+/// until every member's record is installed, and each member's write.
+struct ChunkWrite<'a> {
+    key_lock: DiskKeyGuard<'a>,
+    members: Vec<DiskWrite<'a>>,
+}
+
+/// What evicting one batch of a chunk does, decided before any of the
+/// chunk's batches is touched.
+enum Step {
+    /// Stays in memory, in this new form.
+    Keep(CacheEntry),
+    /// Goes to disk as this record, written as these bytes.
+    Spill { record: CacheEntry, bytes: Bytes },
+    /// Already on disk, left as it is.
+    Leave,
+    /// On disk, removed.
+    Remove,
+    /// Leaves memory with nothing in its place.
+    Drop,
+}
+
+/// One batch of a chunk being evicted: the identity it was read under, the
+/// memory entry it holds now (to drop only that one), and its next step.
+struct Victim {
+    entry: EntryID,
+    identity: u64,
+    current: CacheEntry,
+    step: Step,
+}
+
+/// The tag a batch's form is stored under in its object.
+const FORM_ARROW: u8 = 0;
+const FORM_LIQUID: u8 = 1;
+
+/// How whole chunks moved between tiers, counted as they move.
+#[derive(Debug, Default)]
+struct TierEvents {
+    spilled: std::sync::atomic::AtomicU64,
+    dropped_from_memory: std::sync::atomic::AtomicU64,
+    dropped_from_disk: std::sync::atomic::AtomicU64,
+    promoted: std::sync::atomic::AtomicU64,
+}
+
+impl TierEvents {
+    fn add(counter: &std::sync::atomic::AtomicU64, by: u64) {
+        counter.fetch_add(by, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn load(counter: &std::sync::atomic::AtomicU64) -> u64 {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// The batches and bytes one form holds, from incremental counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct FormHoldings {
+    /// Entries in the form.
+    pub entries: usize,
+    /// Bytes they are charged: memory for a memory form, the disk budget
+    /// share for a disk one.
+    pub bytes: usize,
+}
+
+/// What the cache holds per tier and form, and how chunks moved, read from
+/// counters kept as entries change, never from a walk of the index.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct TierCounters {
+    /// Arrow batches in memory.
+    pub memory_arrow: FormHoldings,
+    /// Liquid batches in memory.
+    pub memory_liquid: FormHoldings,
+    /// Arrow batches on disk.
+    pub disk_arrow: FormHoldings,
+    /// Liquid batches on disk.
+    pub disk_liquid: FormHoldings,
+    /// Chunks the policy holds, per tier and form.
+    pub chunks: crate::cache::ChunkCounts,
+    /// Chunks written from memory to disk.
+    pub chunks_spilled: u64,
+    /// Chunks dropped from memory with nothing in their place.
+    pub chunks_dropped_from_memory: u64,
+    /// Chunks dropped from disk to make room.
+    pub chunks_dropped_from_disk: u64,
+    /// Chunks read back from disk into memory by [`LiquidCache::promote`].
+    pub chunks_promoted: u64,
+    /// Disk reads whose object's header or directory did not match.
+    pub disk_mismatches: u64,
 }
 
 /// Keys whose object an operation was dropped before deleting, or wrote and
@@ -825,9 +945,12 @@ impl LiquidCache {
         metadata: Arc<dyn EntryMetadata>,
         store: DiskStore,
         evict_victims_concurrently: bool,
+        chunk_bits: u32,
     ) -> Self {
         let config = CacheConfig::new(batch_size, max_memory_bytes, max_disk_bytes);
         let observer = Arc::new(Observer::new());
+        let chunk_mask = usize::MAX.checked_shl(chunk_bits).unwrap_or(0);
+        cache_policy.group_by_chunk(chunk_bits);
         Self {
             index: ArtIndex::new(),
             budget: BudgetAccounting::new(
@@ -842,9 +965,11 @@ impl LiquidCache {
             observer,
             metadata,
             store,
-            disk_key_locks: DiskKeyLocks::new(),
+            disk_key_locks: DiskKeyLocks::new(chunk_mask),
             stray_objects: StrayObjects::default(),
             evict_victims_concurrently,
+            chunk_mask,
+            events: TierEvents::default(),
             background_text: std::sync::OnceLock::new(),
         }
     }
@@ -871,6 +996,12 @@ impl LiquidCache {
             write.is_some() || Self::charged_bytes(&to_insert).is_none(),
             "a disk record is installed only by the write that charged it"
         );
+        // A disk record holds exactly its write's share of the object's
+        // charge, whatever length its caller gave it.
+        let to_insert = match &write {
+            Some(write) => to_insert.charged_at(write.charge.bytes),
+            None => to_insert,
+        };
         let new_memory_size = to_insert.memory_usage_bytes();
         // Only growth over the slot read here is reserved against the budget.
         // The rest of the entry is charged before it enters the index, so a
@@ -932,7 +1063,9 @@ impl LiquidCache {
                 charge.pass_to_record();
                 unnamed.settled();
                 // Released before the policy hears of the insert, so a policy
-                // that reacts by writing this key does not wait on itself.
+                // that reacts by writing this key does not wait on itself. A
+                // chunk write holds its lock over all its members' installs
+                // instead, and releases it after the last.
                 drop(key_lock);
                 Orphan(None)
             }
@@ -948,12 +1081,13 @@ impl LiquidCache {
         Ok(orphan)
     }
 
-    /// The disk budget a record holds: the extent its object takes, header
-    /// and padding included ([`DiskStore::footprint`]).
+    /// The disk budget a record holds: its share of the extent its object
+    /// takes, header, directory and padding included
+    /// ([`DiskStore::chunk_footprint`]).
     fn charged_bytes(entry: &CacheEntry) -> Option<usize> {
         match entry {
             CacheEntry::DiskLiquid { disk_bytes, .. }
-            | CacheEntry::DiskArrow { disk_bytes, .. } => Some(DiskStore::footprint(*disk_bytes)),
+            | CacheEntry::DiskArrow { disk_bytes, .. } => Some(*disk_bytes),
             CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => None,
         }
     }
@@ -1125,8 +1259,10 @@ impl LiquidCache {
         &self.index
     }
 
-    /// Evict `victims`. Victims of an eviction the caller dropped before it
-    /// finished are offered to the policy again (see [`VictimLease`]).
+    /// Evict `victims`, chunk by chunk: the batches of one chunk move
+    /// together (see [`Self::evict_chunk`]). Victims of an eviction the
+    /// caller dropped before it finished are offered to the policy again
+    /// (see [`VictimLease`]).
     #[fastrace::trace]
     async fn evict_victims(&self, victims: Vec<EntryID>) {
         self.trace(InternalEvent::EvictionBegin {
@@ -1136,100 +1272,257 @@ impl LiquidCache {
             cache: self,
             pending: victims.clone(),
         };
+        let chunks = self.by_chunk(victims);
         if self.evict_victims_concurrently {
-            let mut evictions = futures::stream::iter(victims)
-                .map(|victim| async move {
-                    self.evict_victim_inner(victim).await;
-                    victim
+            let mut evictions = futures::stream::iter(chunks)
+                .map(|members| async move {
+                    self.evict_chunk(&members).await;
+                    members
                 })
                 .buffer_unordered(usize::MAX);
-            while let Some(victim) = evictions.next().await {
-                lease.evicted(victim);
+            while let Some(members) = evictions.next().await {
+                for victim in members {
+                    lease.evicted(victim);
+                }
             }
         } else {
-            for victim in victims {
-                self.evict_victim_inner(victim).await;
-                lease.evicted(victim);
+            for members in chunks {
+                self.evict_chunk(&members).await;
+                for victim in members {
+                    lease.evicted(victim);
+                }
             }
         }
     }
 
-    /// Evict `victim` to its next form, or drop it from memory when it has
-    /// none the disk can take.
-    async fn evict_victim_inner(&self, victim: EntryID) {
-        let Some(slot) = self.index.get(&victim) else {
-            return;
-        };
-        // The rewrite is made for the identity the victim was read under. If
-        // another identity takes the key over meanwhile, the rewrite still
-        // carries the old identity, so the new owner reads it as a miss.
-        let identity = slot.identity;
-        let observed = slot.entry.clone();
-        let mut victim_entry = slot.entry.clone();
-        self.trace(InternalEvent::EvictionVictim { entry: victim });
-        loop {
-            // A memory victim that the disk cannot take is dropped: dropping
-            // it is the only way to free its memory, and without it a full
-            // memory tier refuses every insert and keeps what it cached first.
-            // A later read misses and goes to the source, as the flush does.
-            //
-            // With no disk tier, a Liquid victim's next step is always the
-            // disk, so it is dropped before the policy serialises it for a
-            // write that cannot happen.
-            if self.config.max_disk_bytes() == 0
-                && matches!(victim_entry, CacheEntry::MemoryLiquid(_))
-            {
-                self.drop_memory_victim(victim, &observed);
-                break;
-            }
-            let outcome = self
-                .eviction_policy
-                .evict(&victim_entry, self.metadata.lineage(&victim).as_deref());
-
-            match outcome {
-                EvictionOutcome::Replace {
-                    entry: new_batch,
-                    bytes_to_write,
-                } => {
-                    let write = match bytes_to_write {
-                        Some(bytes_to_write) => match self
-                            .write_batch_to_disk(victim, identity, &new_batch, bytes_to_write)
-                            .await
-                        {
-                            Ok(write) => Some(write),
-                            Err(CacheFull) => {
-                                self.drop_memory_victim(victim, &observed);
-                                break;
-                            }
-                        },
-                        // The policy left the record on disk as it was. The
-                        // key may hold something newer by now, and the object
-                        // that record named may be gone, so nothing is
-                        // installed.
-                        None if Self::charged_bytes(&new_batch).is_some() => break,
-                        None => None,
-                    };
-                    match self.try_insert(victim, identity, new_batch, write) {
-                        Ok(orphan) => {
-                            self.reclaim(orphan).await;
-                            break;
-                        }
-                        Err(batch) => {
-                            victim_entry = batch;
-                        }
+    /// `entries` grouped by chunk, in the order each chunk first appears.
+    fn by_chunk(&self, entries: Vec<EntryID>) -> Vec<Vec<EntryID>> {
+        let mut chunks: Vec<(EntryID, Vec<EntryID>)> = Vec::new();
+        for entry in entries {
+            let chunk = self.chunk_of(&entry);
+            match chunks.iter_mut().find(|(id, _)| *id == chunk) {
+                Some((_, members)) => {
+                    if !members.contains(&entry) {
+                        members.push(entry);
                     }
                 }
-                EvictionOutcome::Remove => {
-                    self.remove_disk_entry(victim).await;
-                    break;
-                }
-                // The policy found no form to keep the victim in: it leaves
-                // memory with nothing in its place, as a full disk would.
-                EvictionOutcome::Drop => {
-                    self.drop_memory_victim(victim, &observed);
-                    break;
+                None => chunks.push((chunk, vec![entry])),
+            }
+        }
+        chunks.into_iter().map(|(_, members)| members).collect()
+    }
+
+    /// The chunk `entry_id` belongs to: the id with its batch bits cleared
+    /// ([`crate::cache::LiquidCacheBuilder::with_chunk_bits`]). Every entry
+    /// is its own chunk unless chunk bits are set.
+    pub fn chunk_of(&self, entry_id: &EntryID) -> EntryID {
+        EntryID::from(usize::from(*entry_id) & self.chunk_mask)
+    }
+
+    /// Evict `members`, batches of one chunk, together.
+    ///
+    /// **A chunk is evicted whole or not at all.** Every member's next step
+    /// is decided first. If one must leave memory with nothing in its place,
+    /// every memory member is dropped. Otherwise, if any goes to disk, every
+    /// memory member goes, in one object; one the policy would only
+    /// transcode is moved on to its disk form too. Only when none leaves
+    /// memory do the members stay, each in its new form. Disk members the
+    /// policy removes are removed.
+    async fn evict_chunk(&self, members: &[EntryID]) {
+        let mut victims = Vec::with_capacity(members.len());
+        for &entry in members {
+            let Some(slot) = self.index.get(&entry) else {
+                continue;
+            };
+            self.trace(InternalEvent::EvictionVictim { entry });
+            let step = self.next_step(entry, &slot.entry);
+            victims.push(Victim {
+                entry,
+                identity: slot.identity,
+                current: slot.entry.clone(),
+                step,
+            });
+        }
+        for victim in &victims {
+            if matches!(victim.step, Step::Remove) {
+                self.remove_disk_entry(victim.entry).await;
+            }
+        }
+        // A spill takes the whole chunk out of memory: members the policy
+        // only transcodes take their next step as well.
+        for _ in 0..Self::MAX_STEPS {
+            if !Self::any_spill(&victims) {
+                break;
+            }
+            for victim in &mut victims {
+                if let Step::Keep(next) = &victim.step {
+                    let next = next.clone();
+                    victim.step = self.next_step(victim.entry, &next);
                 }
             }
+        }
+        if Self::any_spill(&victims) {
+            for victim in &mut victims {
+                if matches!(victim.step, Step::Keep(_)) {
+                    victim.step = Step::Drop;
+                }
+            }
+        }
+        if victims.iter().any(|victim| matches!(victim.step, Step::Drop)) {
+            self.drop_chunk(&victims);
+            return;
+        }
+        if !Self::any_spill(&victims) {
+            for index in 0..victims.len() {
+                let Some(victim) = victims.get_mut(index) else {
+                    continue;
+                };
+                let Step::Keep(next) = std::mem::replace(&mut victim.step, Step::Leave) else {
+                    continue;
+                };
+                let (entry, identity) = (victim.entry, victim.identity);
+                let installed = next.clone();
+                match self.try_insert(entry, identity, next, None) {
+                    Ok(orphan) => {
+                        victim.current = installed;
+                        self.reclaim(orphan).await;
+                    }
+                    Err(_) => {
+                        self.drop_chunk(&victims);
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+        self.spill_chunk(victims).await;
+    }
+
+    fn any_spill(victims: &[Victim]) -> bool {
+        victims
+            .iter()
+            .any(|victim| matches!(victim.step, Step::Spill { .. }))
+    }
+
+    /// The most rounds a member the policy only transcodes is moved on for
+    /// its chunk's spill.
+    const MAX_STEPS: usize = 4;
+
+    /// What evicting `entry`, which holds `current`, does next.
+    fn next_step(&self, entry: EntryID, current: &CacheEntry) -> Step {
+        let disk = self.config.max_disk_bytes() > 0;
+        // With no disk tier, a Liquid victim's next step is always the disk,
+        // so it is dropped before the policy serialises it for a write that
+        // cannot happen.
+        if !disk && matches!(current, CacheEntry::MemoryLiquid(_)) {
+            return Step::Drop;
+        }
+        match self
+            .eviction_policy
+            .evict(current, self.metadata.lineage(&entry).as_deref())
+        {
+            EvictionOutcome::Replace {
+                entry: record,
+                bytes_to_write: Some(bytes),
+            } => {
+                if disk {
+                    Step::Spill { record, bytes }
+                } else {
+                    Step::Drop
+                }
+            }
+            // The policy left the record on disk as it was. The key may hold
+            // something newer by now, and the object that record named may
+            // be gone, so nothing is installed.
+            EvictionOutcome::Replace {
+                entry,
+                bytes_to_write: None,
+            } if Self::charged_bytes(&entry).is_some() => Step::Leave,
+            EvictionOutcome::Replace {
+                entry,
+                bytes_to_write: None,
+            } => Step::Keep(entry),
+            EvictionOutcome::Remove => Step::Remove,
+            // The policy found no form to keep the victim in: it leaves
+            // memory with nothing in its place, as a full disk would.
+            EvictionOutcome::Drop => Step::Drop,
+        }
+    }
+
+    /// Drop every member of a chunk that still holds the memory entry its
+    /// eviction saw or installed. A memory victim that the disk cannot take
+    /// is dropped: dropping it is the only way to free its memory, and
+    /// without it a full memory tier refuses every insert and keeps what it
+    /// cached first. A later read misses and goes to the source.
+    fn drop_chunk(&self, victims: &[Victim]) {
+        let mut dropped = false;
+        for victim in victims {
+            if Self::charged_bytes(&victim.current).is_none() {
+                self.drop_memory_victim(victim.entry, &victim.current);
+                dropped = true;
+            }
+        }
+        if dropped {
+            TierEvents::add(&self.events.dropped_from_memory, 1);
+        }
+    }
+
+    /// Write every member that goes to disk as one object, and install
+    /// their records under the chunk's lock. A chunk read for several
+    /// identities cannot share an object; it is dropped.
+    async fn spill_chunk(&self, victims: Vec<Victim>) {
+        let identity = victims
+            .iter()
+            .find(|victim| matches!(victim.step, Step::Spill { .. }))
+            .map(|victim| victim.identity);
+        let Some(identity) = identity else {
+            return;
+        };
+        if victims.iter().any(|victim| {
+            matches!(victim.step, Step::Spill { .. }) && victim.identity != identity
+        }) {
+            self.drop_chunk(&victims);
+            return;
+        }
+        let mut records = Vec::new();
+        let mut batches = Vec::new();
+        for victim in &victims {
+            if let Step::Spill { record, bytes } = &victim.step {
+                batches.push(StoredBatch::new(
+                    victim.entry,
+                    Self::form_of(record),
+                    bytes.clone(),
+                ));
+                records.push((victim.entry, record.clone()));
+            }
+        }
+        let ChunkWrite { key_lock, members } = match self.write_chunk(identity, batches).await {
+            Ok(write) => write,
+            Err(CacheFull) => {
+                self.drop_chunk(&victims);
+                return;
+            }
+        };
+        let mut orphans = Vec::new();
+        for ((entry, record), write) in records.into_iter().zip(members) {
+            // A disk record always installs (see `try_insert`); were it
+            // refused, dropping the write would give its charge back.
+            if let Ok(orphan) = self.try_insert(entry, identity, record, Some(write)) {
+                orphans.push(orphan);
+            }
+        }
+        drop(key_lock);
+        TierEvents::add(&self.events.spilled, 1);
+        for orphan in orphans {
+            self.reclaim(orphan).await;
+        }
+    }
+
+    /// The tag `record`'s form is stored under.
+    fn form_of(record: &CacheEntry) -> u8 {
+        match record {
+            CacheEntry::MemoryLiquid(_) | CacheEntry::DiskLiquid { .. } => FORM_LIQUID,
+            CacheEntry::MemoryArrow(_) | CacheEntry::DiskArrow { .. } => FORM_ARROW,
         }
     }
 
@@ -1385,23 +1678,11 @@ impl LiquidCache {
         }
     }
 
-    /// Write `bytes` to disk as `entry_id`'s object for `identity`.
-    ///
-    /// Objects are keyed by entry id alone, so a write landing after the key
-    /// changed hands can leave one identity's bytes where another's entry
-    /// points. The store's header names the identity, so a read under the
-    /// other one misses. The disk budget is charged the extent the object
-    /// takes ([`DiskStore::footprint`]), not only its payload.
-    ///
-    /// A failed put is counted and refused like a full disk: the caller drops
-    /// the entry. The store then holds no new object for the key, and the key
-    /// is left to [`StrayObjects`], which deletes any older object no record
-    /// names. A put the store refuses for want of a long enough free extent
-    /// is such a failure too; evicting disk victims for it would take their
-    /// keys' locks while this key's is held.
+    /// Write `bytes` to disk as `entry_id`'s object for `identity`: a chunk
+    /// object of one batch (see [`Self::write_chunk`]).
     ///
     /// Returns the write for [`Self::try_insert`] to install the record
-    /// naming the object with.
+    /// naming the object with; it holds the chunk's lock until then.
     async fn write_batch_to_disk(
         &self,
         entry_id: EntryID,
@@ -1409,9 +1690,50 @@ impl LiquidCache {
         batch: &CacheEntry,
         bytes: Bytes,
     ) -> Result<DiskWrite<'_>, CacheFull> {
+        let batch = StoredBatch::new(entry_id, Self::form_of(batch), bytes);
+        let ChunkWrite {
+            key_lock,
+            mut members,
+        } = self.write_chunk(identity, vec![batch]).await?;
+        let mut write = members.pop().ok_or(CacheFull)?;
+        write.key_lock = Some(key_lock);
+        Ok(write)
+    }
+
+    /// Write `batches`, all of one chunk, to disk as one object for
+    /// `identity`, and name it as each batch's object.
+    ///
+    /// Objects are named by entry id, so a write landing after the key
+    /// changed hands can leave one identity's bytes where another's entry
+    /// points. The store's header names the identity, so a read under the
+    /// other one misses. The disk budget is charged the extent the object
+    /// takes ([`DiskStore::chunk_footprint`]), split exactly among the
+    /// batches' records, so the object is charged once.
+    ///
+    /// A failed put is counted and refused like a full disk: the caller drops
+    /// the entries. The store then holds no new object for them, and each key
+    /// is left to [`StrayObjects`], which deletes any older name no record
+    /// relies on. A put the store refuses for want of a long enough free
+    /// extent is such a failure too; evicting disk victims for it would take
+    /// their chunks' locks while this one's is held.
+    async fn write_chunk(
+        &self,
+        identity: u64,
+        batches: Vec<StoredBatch>,
+    ) -> Result<ChunkWrite<'_>, CacheFull> {
+        let chunk = batches
+            .first()
+            .map(|batch| self.chunk_of(&batch.entry()))
+            .ok_or(CacheFull)?;
+        if batches
+            .iter()
+            .any(|batch| self.chunk_of(&batch.entry()) != chunk)
+        {
+            return Err(CacheFull);
+        }
         self.delete_strays().await;
-        let len = bytes.len();
-        let charged = DiskStore::footprint(len);
+        let charged = DiskStore::chunk_footprint(batches.iter().map(|batch| batch.bytes().len()))
+            .ok_or(CacheFull)?;
         loop {
             if self.budget.try_reserve_disk(charged).is_ok() {
                 break;
@@ -1420,7 +1742,9 @@ impl LiquidCache {
             if victims.is_empty() {
                 return Err(CacheFull);
             }
-            for victim in victims {
+            let dropped = self.by_chunk(victims);
+            TierEvents::add(&self.events.dropped_from_disk, dropped.len() as u64);
+            for victim in dropped.into_iter().flatten() {
                 self.remove_disk_entry(victim).await;
             }
         }
@@ -1428,39 +1752,71 @@ impl LiquidCache {
             budget: &self.budget,
             bytes: charged,
         };
-        self.trace(InternalEvent::IoWrite {
-            entry: entry_id,
-            kind: CachedBatchType::from(batch),
-            bytes: len,
-        });
-        // Taken only now: removing the victims above takes their keys' locks.
-        let key_lock = self.disk_key_locks.lock(&entry_id).await;
-        let unnamed = self.unfinished_object(entry_id);
+        for batch in &batches {
+            self.trace(InternalEvent::IoWrite {
+                entry: batch.entry(),
+                kind: if batch.form() == FORM_LIQUID {
+                    CachedBatchType::DiskLiquid
+                } else {
+                    CachedBatchType::DiskArrow
+                },
+                bytes: batch.bytes().len(),
+            });
+        }
+        let entries: Vec<EntryID> = batches.iter().map(StoredBatch::entry).collect();
+        // Taken only now: removing the victims above takes their chunks' locks.
+        let key_lock = self.disk_key_locks.lock(&chunk).await;
+        let unnamed: Vec<UnfinishedObject<'_>> = entries
+            .iter()
+            .map(|entry| self.unfinished_object(*entry))
+            .collect();
         if let Err(error) = self
             .store
-            .put(ObjectKey::new(entry_id, identity), bytes)
+            .put_chunk(ObjectKey::new(chunk, identity), batches)
             .await
         {
             self.observer.on_disk_write_failure(&error);
             return Err(CacheFull);
         }
-        Ok(DiskWrite {
-            key_lock,
-            charge,
-            unnamed,
-        })
+        let members = charge
+            .split(unnamed.len())
+            .into_iter()
+            .zip(unnamed)
+            .map(|(charge, unnamed)| DiskWrite {
+                key_lock: None,
+                charge,
+                unnamed,
+            })
+            .collect();
+        Ok(ChunkWrite { key_lock, members })
     }
 
-    /// The payload stored under `entry_id`, if it was written for `identity`.
+    /// The payload stored for `entry_id`, if it was written for `identity`.
     ///
-    /// The store returns bytes only when the object's header names this
-    /// entry and identity and its checksum matches. No object, or one another
-    /// identity wrote since the key changed hands, is a plain miss. An object
-    /// that cannot be read, or does not match its header, is a failure: it is
-    /// counted, and the record naming it dropped so no later read tries it.
+    /// The store returns an object only when its header names this entry's
+    /// chunk and identity, its checksum matches and its directory lists the
+    /// entry. No object, or one another identity wrote since the key changed
+    /// hands, is a plain miss. An object that cannot be read, or does not
+    /// match its header, is a failure: it is counted, and the record naming
+    /// it dropped so no later read tries it. The batch is copied out of the
+    /// chunk's buffer, so an array decoded from it and kept in memory is
+    /// charged for what it holds and pins no other batch's bytes.
     async fn read_disk_bytes(&self, entry_id: &EntryID, identity: u64) -> Option<Bytes> {
-        match self.store.get(ObjectKey::new(*entry_id, identity)).await {
-            Ok(payload) => Some(payload),
+        let object = self.read_object(entry_id, identity).await?;
+        let (_, bytes) = object.batch(entry_id)?;
+        Some(Bytes::copy_from_slice(&bytes))
+    }
+
+    /// The object `entry_id` names, read whole, if written for `identity`;
+    /// failures as [`Self::read_disk_bytes`].
+    async fn read_object(
+        &self,
+        entry_id: &EntryID,
+        identity: u64,
+    ) -> Option<crate::cache::disk::ChunkObject> {
+        let key = ObjectKey::new(self.chunk_of(entry_id), identity);
+        match self.store.get_chunk(*entry_id, key).await {
+            Ok(object) => Some(object),
             Err(DiskError::NotFound | DiskError::Foreign) => None,
             Err(error) => {
                 self.observer.on_disk_read_failure(&error);
@@ -1468,6 +1824,184 @@ impl LiquidCache {
                 self.drop_unreadable(*entry_id, identity).await;
                 None
             }
+        }
+    }
+
+    /// A batch of `form` decoded from `bytes`, as a memory entry. The
+    /// array's buffers slice `bytes`.
+    fn decode_form(form: u8, bytes: Bytes) -> Result<CacheEntry, String> {
+        match form {
+            FORM_ARROW => Self::decode_arrow(bytes)
+                .map(CacheEntry::memory_arrow)
+                .map_err(|error| error.to_string()),
+            FORM_LIQUID => crate::liquid_array::LiquidArray::try_from_bytes(bytes)
+                .map(|array| CacheEntry::memory_liquid(Arc::new(array)))
+                .map_err(|error| error.to_string()),
+            other => Err(format!("no batch form is tagged {other}")),
+        }
+    }
+
+    /// Whether `entry_id` is held on disk for `identity`.
+    pub fn is_on_disk(&self, entry_id: &EntryID, identity: u64) -> bool {
+        self.index
+            .get_for(entry_id, identity)
+            .is_some_and(|slot| Self::charged_bytes(&slot.entry).is_some())
+    }
+
+    /// Every batch of the object `entry_id`'s disk record names, read in one
+    /// `pread` and decoded for one read: each entry the index still holds on
+    /// disk for `identity`, with its array in memory form. The arrays slice
+    /// the one read buffer. Nothing is inserted, so the read moves nothing
+    /// between tiers; [`Self::promote`] does.
+    ///
+    /// The object holds bytes of one identity, and an identity names one
+    /// immutable source, so any object listing an entry under that identity
+    /// holds that entry's bytes, even one a newer write has since replaced.
+    /// A batch that does not decode is counted and its record dropped.
+    pub async fn read_chunk(
+        &self,
+        entry_id: &EntryID,
+        identity: u64,
+    ) -> Vec<(EntryID, Arc<CacheEntry>)> {
+        let Some(slot) = self.index.get_for(entry_id, identity) else {
+            return Vec::new();
+        };
+        if Self::charged_bytes(&slot.entry).is_none() {
+            return Vec::new();
+        }
+        self.cache_policy
+            .notify_access(entry_id, CachedBatchType::from(&slot.entry));
+        let Some(object) = self.read_object(entry_id, identity).await else {
+            return Vec::new();
+        };
+        let mut read = Vec::new();
+        let mut unreadable = Vec::new();
+        for (entry, form, bytes) in object.batches() {
+            if !self.is_on_disk(&entry, identity) {
+                continue;
+            }
+            match Self::decode_form(form, bytes) {
+                Ok(decoded) => read.push((entry, Arc::new(decoded))),
+                Err(error) => {
+                    self.observer.on_disk_read_failure(&error);
+                    unreadable.push(entry);
+                }
+            }
+        }
+        for entry in unreadable {
+            self.drop_unreadable(entry, identity).await;
+        }
+        read
+    }
+
+    /// Read `entries` held on disk for `identity` back into memory, one
+    /// object read per chunk: how many were installed. Each batch is copied
+    /// out of the read buffer before it is inserted, so it is charged what
+    /// it holds. An insert the memory tier refuses leaves that batch on disk.
+    pub async fn promote(&self, entries: &[EntryID], identity: u64) -> usize {
+        let mut promoted = 0;
+        for members in self.by_chunk(entries.to_vec()) {
+            let Some(first) = members.iter().find(|entry| self.is_on_disk(entry, identity))
+            else {
+                continue;
+            };
+            let Some(object) = self.read_object(first, identity).await else {
+                continue;
+            };
+            let mut installed = 0;
+            for entry in &members {
+                if !self.is_on_disk(entry, identity) {
+                    continue;
+                }
+                let Some((form, bytes)) = object.batch(entry) else {
+                    continue;
+                };
+                let decoded = match Self::decode_form(form, Bytes::copy_from_slice(&bytes)) {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        self.observer.on_disk_read_failure(&error);
+                        self.drop_unreadable(*entry, identity).await;
+                        continue;
+                    }
+                };
+                if self.insert_inner(*entry, identity, decoded).await.is_ok() {
+                    installed += 1;
+                }
+            }
+            if installed > 0 {
+                TierEvents::add(&self.events.promoted, 1);
+            }
+            promoted += installed;
+        }
+        promoted
+    }
+
+    /// `array` in the form the cache keeps a fresh batch in: Liquid when it
+    /// transcodes to something smaller, else Arrow with its view buffers
+    /// compacted.
+    pub fn encode(array: &ArrayRef) -> CacheEntry {
+        let arrow = super::builders::maybe_gc_view_arrays(array).unwrap_or_else(|| Arc::clone(array));
+        match crate::liquid_array::LiquidArray::from_arrow_array(&arrow) {
+            Ok(liquid) if liquid.get_array_memory_size() < arrow.get_array_memory_size() => {
+                CacheEntry::memory_liquid(Arc::new(liquid))
+            }
+            Ok(_) | Err(_) => CacheEntry::memory_arrow(arrow),
+        }
+    }
+
+    /// Insert every batch of one chunk for `identity`, each a memory entry
+    /// from [`Self::encode`]. All go in or none: on a refusal the batches
+    /// already inserted are evicted again, so a chunk is never left part
+    /// cached by its insert.
+    pub async fn insert_chunk(
+        &self,
+        identity: u64,
+        batches: Vec<(EntryID, CacheEntry)>,
+    ) -> Result<(), CacheFull> {
+        let mut inserted = Vec::with_capacity(batches.len());
+        for (entry, batch) in batches {
+            if self.insert_inner(entry, identity, batch).await.is_err() {
+                self.remove_inserted(&inserted, identity).await;
+                return Err(CacheFull);
+            }
+            inserted.push(entry);
+        }
+        Ok(())
+    }
+
+    /// Take `entries`, inserted for `identity` by a chunk insert that was
+    /// refused, out of whichever tier they reached.
+    async fn remove_inserted(&self, entries: &[EntryID], identity: u64) {
+        for entry in entries {
+            let Some(slot) = self.index.get_for(entry, identity) else {
+                continue;
+            };
+            if Self::charged_bytes(&slot.entry).is_some() {
+                self.remove_disk_record(*entry, Some(identity)).await;
+            } else {
+                self.drop_memory_victim(*entry, &slot.entry);
+            }
+        }
+    }
+
+    /// What the cache holds per tier and form, from counters kept as entries
+    /// change, and how chunks moved.
+    pub fn counters(&self) -> TierCounters {
+        let held = |form: CachedBatchType| {
+            let (entries, bytes) = self.index.holdings(form);
+            FormHoldings { entries, bytes }
+        };
+        TierCounters {
+            memory_arrow: held(CachedBatchType::MemoryArrow),
+            memory_liquid: held(CachedBatchType::MemoryLiquid),
+            disk_arrow: held(CachedBatchType::DiskArrow),
+            disk_liquid: held(CachedBatchType::DiskLiquid),
+            chunks: self.cache_policy.chunk_counts(),
+            chunks_spilled: TierEvents::load(&self.events.spilled),
+            chunks_dropped_from_memory: TierEvents::load(&self.events.dropped_from_memory),
+            chunks_dropped_from_disk: TierEvents::load(&self.events.dropped_from_disk),
+            chunks_promoted: TierEvents::load(&self.events.promoted),
+            disk_mismatches: self.store.mismatches(),
         }
     }
 
@@ -2174,8 +2708,8 @@ mod tests {
     async fn insert_until_disk_full_then_evicts_oldest_disk_entry() {
         let first_array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
         let second_array: ArrayRef = Arc::new(Int32Array::from_iter_values(16..32));
-        let first_bytes = DiskStore::footprint(arrow_to_bytes(&first_array).unwrap().len());
-        let second_bytes = DiskStore::footprint(arrow_to_bytes(&second_array).unwrap().len());
+        let first_bytes = one_batch_footprint(arrow_to_bytes(&first_array).unwrap().len());
+        let second_bytes = one_batch_footprint(arrow_to_bytes(&second_array).unwrap().len());
         let cache = LiquidCacheBuilder::new()
             .with_max_memory_bytes(1 << 20)
             .with_max_disk_bytes(first_bytes.max(second_bytes))
@@ -2226,7 +2760,7 @@ mod tests {
     #[tokio::test]
     async fn disk_eviction_releases_budget() {
         let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
-        let disk_bytes = DiskStore::footprint(arrow_to_bytes(&array).unwrap().len());
+        let disk_bytes = one_batch_footprint(arrow_to_bytes(&array).unwrap().len());
         let cache = LiquidCacheBuilder::new()
             .with_max_memory_bytes(1 << 20)
             .with_max_disk_bytes(disk_bytes)
@@ -2399,7 +2933,7 @@ mod tests {
         let flushed = EntryID::from(921usize);
         let hydrated_array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..16));
         let flushed_array: ArrayRef = Arc::new(Int32Array::from_iter_values(16..32));
-        let disk_bytes = DiskStore::footprint(arrow_to_bytes(&hydrated_array).unwrap().len());
+        let disk_bytes = one_batch_footprint(arrow_to_bytes(&hydrated_array).unwrap().len());
         let hook = Arc::new(std::sync::Mutex::new(None::<DiskVictimHook>));
         let cache = block_on(
             LiquidCacheBuilder::new()
@@ -2471,7 +3005,7 @@ mod tests {
     #[tokio::test]
     async fn hydrate_and_spill_cycles_hold_one_disk_copy() {
         let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..1024));
-        let one_copy = DiskStore::footprint(arrow_to_bytes(&array).unwrap().len());
+        let one_copy = one_batch_footprint(arrow_to_bytes(&array).unwrap().len());
         let (cache, store, _directory) = cache_over_counted_store(1 << 20, 4 * one_copy).await;
         let entry = EntryID::from(930usize);
         cache.insert(entry, 0, array.clone()).await.unwrap();
@@ -2594,9 +3128,14 @@ mod tests {
         };
     }
 
+    /// The disk an object holding one batch of `len` bytes is charged.
+    fn one_batch_footprint(len: usize) -> usize {
+        DiskStore::chunk_footprint(std::iter::once(len)).unwrap()
+    }
+
     /// The disk an Arrow array's record is charged.
     fn arrow_copy(array: &ArrayRef) -> usize {
-        DiskStore::footprint(arrow_to_bytes(array).unwrap().len())
+        one_batch_footprint(arrow_to_bytes(array).unwrap().len())
     }
 
     /// A cache holding `array` under `entry` on disk, spilled by a flush.
@@ -2716,9 +3255,10 @@ mod tests {
     #[tokio::test]
     async fn a_read_dropped_while_reclaiming_leaves_its_object_to_the_next_spill() {
         let entry = EntryID::from(949usize);
+        let locks = DiskKeyLocks::new(usize::MAX);
         let blocker = (950usize..)
             .map(EntryID::from)
-            .find(|id| DiskKeyLocks::lock_of(id) == DiskKeyLocks::lock_of(&entry))
+            .find(|id| locks.lock_of(id) == locks.lock_of(&entry))
             .unwrap();
         let next = EntryID::from(usize::from(blocker) + 1);
         let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
@@ -3662,7 +4202,7 @@ mod tests {
             .unwrap();
         let held = snapshot(&cache, entry_id).await;
 
-        cache.evict_victim_inner(entry_id).await;
+        cache.evict_chunk(&[entry_id]).await;
 
         let slot = cache.index().get(&entry_id).unwrap();
         assert!(matches!(slot.entry, CacheEntry::MemoryLiquid(_)));

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::{common::config::ConfigNonZeroUsize, error::Result};
-use liquid_cache::cache::{AlwaysHydrate, HydrationPolicy, default_max_memory_bytes};
+use liquid_cache::cache::{HydrationPolicy, NoHydration, default_max_memory_bytes};
 use liquid_cache::cache::{EvictionPolicy, TranscodeEvict};
 use liquid_cache::cache_policies::{CachePolicy, LiquidPolicy};
 use liquid_cache_datafusion::optimizers::LocalModeOptimizer;
@@ -87,7 +87,7 @@ impl Default for LiquidCacheLocalBuilder {
             cache_dir: std::env::temp_dir(),
             cache_policy: Box::new(LiquidPolicy::new()),
             eviction_policy: Box::new(TranscodeEvict),
-            hydration_policy: Box::new(AlwaysHydrate::new()),
+            hydration_policy: Box::new(NoHydration::new()),
             prefetch: true,
             admission: None,
             span: fastrace::Span::enter_with_local_parent("liquid_cache_datafusion_local_builder"),

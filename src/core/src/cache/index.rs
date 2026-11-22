@@ -7,7 +7,10 @@ use std::{
     },
 };
 
-use crate::cache::{cached_batch::CacheEntry, utils::EntryID};
+use crate::cache::{
+    cached_batch::{CacheEntry, CachedBatchType},
+    utils::EntryID,
+};
 use crate::sync::RwLock;
 
 /// What the index holds for a key: the entry, and the identity of the source
@@ -67,6 +70,76 @@ pub(crate) struct ArtIndex {
     art: CongeeArc<EntryID, Cell>,
     entry_count: AtomicUsize,
     identity_mismatches: AtomicU64,
+    holdings: Holdings,
+}
+
+/// Entries and bytes the index holds per form, kept as slots go in and out.
+///
+/// A slot's entry never changes once installed, so adding it when the tree
+/// takes it and subtracting it when the tree gives it up (to exactly one
+/// insert or removal) keeps these exact without walking the tree.
+#[derive(Default)]
+struct Holdings {
+    entries: [AtomicUsize; 4],
+    bytes: [AtomicUsize; 4],
+}
+
+impl Holdings {
+    fn form(kind: CachedBatchType) -> usize {
+        match kind {
+            CachedBatchType::MemoryArrow => 0,
+            CachedBatchType::MemoryLiquid => 1,
+            CachedBatchType::DiskArrow => 2,
+            CachedBatchType::DiskLiquid => 3,
+        }
+    }
+
+    /// The bytes `entry` counts: its memory, or a disk record's disk share.
+    fn bytes_of(entry: &CacheEntry) -> usize {
+        match entry {
+            CacheEntry::DiskLiquid { disk_bytes, .. } | CacheEntry::DiskArrow { disk_bytes, .. } => {
+                *disk_bytes
+            }
+            CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => entry.memory_usage_bytes(),
+        }
+    }
+
+    fn add(&self, entry: &CacheEntry) {
+        let form = Self::form(CachedBatchType::from(entry));
+        if let (Some(entries), Some(bytes)) = (self.entries.get(form), self.bytes.get(form)) {
+            entries.fetch_add(1, Ordering::Relaxed);
+            bytes.fetch_add(Self::bytes_of(entry), Ordering::Relaxed);
+        }
+    }
+
+    fn remove(&self, entry: &CacheEntry) {
+        let form = Self::form(CachedBatchType::from(entry));
+        let less = |counter: &AtomicUsize, by: usize| {
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                Some(held.saturating_sub(by))
+            });
+        };
+        if let (Some(entries), Some(bytes)) = (self.entries.get(form), self.bytes.get(form)) {
+            less(entries, 1);
+            less(bytes, Self::bytes_of(entry));
+        }
+    }
+
+    fn get(&self, kind: CachedBatchType) -> (usize, usize) {
+        let form = Self::form(kind);
+        let load = |counters: &[AtomicUsize; 4]| {
+            counters
+                .get(form)
+                .map_or(0, |counter| counter.load(Ordering::Relaxed))
+        };
+        (load(&self.entries), load(&self.bytes))
+    }
+
+    fn clear(&self) {
+        for counter in self.entries.iter().chain(&self.bytes) {
+            counter.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Debug for ArtIndex {
@@ -81,6 +154,7 @@ impl ArtIndex {
             art: CongeeArc::new(),
             entry_count: AtomicUsize::new(0),
             identity_mismatches: AtomicU64::new(0),
+            holdings: Holdings::default(),
         }
     }
 
@@ -132,6 +206,7 @@ impl ArtIndex {
         batch: CacheEntry,
     ) -> Option<Arc<Slot>> {
         let guard = self.art.pin();
+        self.holdings.add(&batch);
         let slot = Slot {
             identity,
             entry: batch,
@@ -140,20 +215,28 @@ impl ArtIndex {
             .art
             .insert(*entry_id, Arc::new(Cell::new(slot)), &guard)
             .expect("Insertion failed");
-        match existing {
+        let replaced = match existing {
             Some(replaced) => replaced.take(),
             None => {
                 self.entry_count.fetch_add(1, Ordering::Relaxed);
                 None
             }
+        };
+        if let Some(replaced) = &replaced {
+            self.holdings.remove(&replaced.entry);
         }
+        replaced
     }
 
     pub(crate) fn remove(&self, entry_id: &EntryID) -> Option<Arc<Slot>> {
         let guard = self.art.pin();
         let removed = self.art.remove(*entry_id, &guard)?;
         self.entry_count.fetch_sub(1, Ordering::Relaxed);
-        removed.take()
+        let removed = removed.take();
+        if let Some(removed) = &removed {
+            self.holdings.remove(&removed.entry);
+        }
+        removed
     }
 
     /// Remove the slot under `entry_id` only if `pred` holds for it.
@@ -182,7 +265,11 @@ impl ArtIndex {
             return None;
         }
         self.entry_count.fetch_sub(1, Ordering::Relaxed);
-        removed.take()
+        let removed = removed.take();
+        if let Some(removed) = &removed {
+            self.holdings.remove(&removed.entry);
+        }
+        removed
     }
 
     pub(crate) fn reset(&self) {
@@ -190,6 +277,12 @@ impl ArtIndex {
             self.remove(&k);
         }
         self.entry_count.store(0, Ordering::Relaxed);
+        self.holdings.clear();
+    }
+
+    /// How many entries of `kind` the index holds, and their bytes.
+    pub(crate) fn holdings(&self, kind: CachedBatchType) -> (usize, usize) {
+        self.holdings.get(kind)
     }
 
     pub(crate) fn for_each(&self, mut f: impl FnMut(&EntryID, &Slot)) {
