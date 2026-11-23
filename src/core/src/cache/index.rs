@@ -242,6 +242,54 @@ impl ArtIndex {
         Ok(replaced)
     }
 
+    /// [`Self::insert`], only over a slot `over` holds for: the slot the
+    /// caller read before it built `batch`, a transcode, spill or promotion
+    /// of what it read.
+    ///
+    /// The check and the replacement are one step, so a removal or another
+    /// write of the key since the caller read it wins and is never undone:
+    /// the batch is handed back, nothing changed. That holds for every key,
+    /// whatever lock its caller holds.
+    pub(crate) fn replace_if(
+        &self,
+        entry_id: &EntryID,
+        identity: u64,
+        batch: CacheEntry,
+        over: impl Fn(&Slot) -> bool,
+    ) -> Result<Option<Arc<Slot>>, CacheEntry> {
+        let guard = self.art.pin();
+        // Counted before it can be seen, as an insert counts it, so a removal
+        // that follows at once never subtracts what was not added.
+        self.holdings.add(&batch);
+        let mut matched = false;
+        let old = self.art.compute_if_present(
+            *entry_id,
+            |cell| {
+                // The tree calls this again when its node changed under it, so
+                // the last call decides.
+                matched = cell.load().is_some_and(|slot| over(&slot));
+                if matched {
+                    Some(Arc::new(Cell::new(Slot {
+                        identity,
+                        entry: batch.clone(),
+                    })))
+                } else {
+                    Some(cell)
+                }
+            },
+            &guard,
+        );
+        if !matched || old.is_none() {
+            self.holdings.remove(&batch);
+            return Err(batch);
+        }
+        let replaced = old.and_then(|old| old.take());
+        if let Some(replaced) = &replaced {
+            self.holdings.remove(&replaced.entry);
+        }
+        Ok(replaced)
+    }
+
     pub(crate) fn remove(&self, entry_id: &EntryID) -> Option<Arc<Slot>> {
         let guard = self.art.pin();
         let removed = self.art.remove(*entry_id, &guard)?;
@@ -441,5 +489,43 @@ mod tests {
         assert!(store.get(&entry_id).is_none());
         assert_eq!(store.entry_count(), 0);
         assert!(store.remove_if(&entry_id, |_| true).is_none());
+    }
+
+    #[test]
+    fn replace_if_never_brings_back_a_removed_slot() {
+        let store = ArtIndex::new();
+        let entry_id = EntryID::from(1);
+        store.insert(&entry_id, 7, create_test_array(10)).unwrap();
+        let held = |kind| store.holdings(kind).0;
+
+        // Over a slot of another identity: refused, nothing changed.
+        assert!(
+            store
+                .replace_if(&entry_id, 7, create_test_array(20), |slot| slot.identity
+                    == 8)
+                .is_err()
+        );
+        assert_eq!(held(CachedBatchType::MemoryArrow), 1);
+
+        // Over the slot it read: replaced, still one entry.
+        let replaced = store
+            .replace_if(&entry_id, 7, create_test_array(20), |slot| {
+                slot.identity == 7
+            })
+            .expect("a matching slot is replaced");
+        assert_eq!(replaced.map(|slot| slot.identity), Some(7));
+        assert_eq!(store.entry_count(), 1);
+        assert_eq!(held(CachedBatchType::MemoryArrow), 1);
+
+        // Removed since: refused, and the key stays empty.
+        store.remove(&entry_id);
+        assert!(
+            store
+                .replace_if(&entry_id, 7, create_test_array(30), |_| true)
+                .is_err()
+        );
+        assert!(store.get(&entry_id).is_none());
+        assert_eq!(store.entry_count(), 0);
+        assert_eq!(held(CachedBatchType::MemoryArrow), 0);
     }
 }
