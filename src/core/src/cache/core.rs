@@ -17,7 +17,11 @@ use super::{
 };
 use crate::cache::policies::{EvictionOutcome, EvictionPolicy};
 use crate::cache::utils::arrow_to_bytes;
-use crate::cache::{CacheExpression, LiquidExpr, index::ArtIndex, utils::EntryID};
+use crate::cache::{
+    CacheExpression, LiquidExpr,
+    index::{ArtIndex, Slot},
+    utils::EntryID,
+};
 use crate::cache::{CacheFull, CacheStats, EventTrace, ReadBudget, ReadCharge};
 use crate::sync::Arc;
 
@@ -417,6 +421,20 @@ pub(super) fn same_memory_entry(slot: &CacheEntry, observed: &CacheEntry) -> boo
     }
 }
 
+/// The slot an install may replace, when it was made from what the key held
+/// ([`LiquidCache::try_insert_over`]).
+type Over<'a> = Option<&'a (dyn Fn(&Slot) -> bool + Send + Sync)>;
+
+/// Whether `slot` still holds, for `identity`, the memory entry `observed`.
+fn holds_memory(slot: &Slot, identity: u64, observed: &CacheEntry) -> bool {
+    slot.belongs_to(identity) && same_memory_entry(&slot.entry, observed)
+}
+
+/// Whether `slot` still holds a disk record for `identity`.
+fn holds_disk(slot: &Slot, identity: u64) -> bool {
+    slot.belongs_to(identity) && LiquidCache::charged_bytes(&slot.entry).is_some()
+}
+
 /// Builder returned by [`LiquidCache::insert`] for configuring cache writes.
 impl LiquidCache {
     /// Call `each` with every entry held in memory, its form and the bytes
@@ -538,9 +556,17 @@ impl LiquidCache {
         // A transcode that does not shrink the array keeps the Arrow entry.
         let shrinks = liquid.get_array_memory_size() < array.get_array_memory_size();
         if current && shrinks {
-            // A full cache refuses the swap; the Arrow entry stays.
+            // A full cache refuses the swap; the Arrow entry stays. An entry
+            // removed or rewritten since is left so.
+            let held = CacheEntry::MemoryArrow(Arc::clone(array));
+            let over = |slot: &Slot| holds_memory(slot, identity, &held);
             let _ = self
-                .insert_inner(entry_id, identity, CacheEntry::memory_liquid(liquid))
+                .insert_over(
+                    entry_id,
+                    identity,
+                    CacheEntry::memory_liquid(liquid),
+                    Some(&over),
+                )
                 .await;
         }
     }
@@ -792,10 +818,13 @@ impl LiquidCache {
                 .write_batch_to_disk(entry_id, identity, &batch, bytes)
                 .await
             {
-                // A disk record always installs (see `try_insert`); were it
-                // refused, dropping the write would give its charge back.
+                // The record goes in only over the entry it was written from;
+                // refused, dropping the write gives its charge back.
                 Ok(write) => {
-                    if let Ok(orphan) = self.try_insert(entry_id, identity, record, Some(write)) {
+                    let over = |slot: &Slot| holds_memory(slot, identity, &batch);
+                    if let Ok(orphan) =
+                        self.try_insert_over(entry_id, identity, record, Some(write), Some(&over))
+                    {
                         self.reclaim(orphan).await;
                     }
                 }
@@ -871,19 +900,41 @@ impl LiquidCache {
         &self,
         entry_id: EntryID,
         identity: u64,
+        batch_to_cache: CacheEntry,
+    ) -> Result<(), CacheFull> {
+        self.insert_over(entry_id, identity, batch_to_cache, None)
+            .await
+    }
+
+    /// [`Self::insert_inner`], and with `over`, only over a slot it holds
+    /// for ([`Self::try_insert_over`]); once the key holds no such slot the
+    /// insert is refused, never made room for.
+    pub(crate) async fn insert_over(
+        &self,
+        entry_id: EntryID,
+        identity: u64,
         mut batch_to_cache: CacheEntry,
+        over: Over<'_>,
     ) -> Result<(), CacheFull> {
         // A write of this entry to disk, made below, for the next install.
         let mut write = None;
         loop {
-            let not_inserted =
-                match self.try_insert(entry_id, identity, batch_to_cache, write.take()) {
-                    Ok(orphan) => {
-                        self.reclaim(orphan).await;
-                        return Ok(());
-                    }
-                    Err(not_inserted) => not_inserted,
-                };
+            let not_inserted = match self.try_insert_over(
+                entry_id,
+                identity,
+                batch_to_cache,
+                write.take(),
+                over,
+            ) {
+                Ok(orphan) => {
+                    self.reclaim(orphan).await;
+                    return Ok(());
+                }
+                Err(not_inserted) => not_inserted,
+            };
+            if over.is_some_and(|over| !self.index.get(&entry_id).is_some_and(|slot| over(&slot))) {
+                return Err(CacheFull);
+            }
             self.trace(InternalEvent::InsertFailed {
                 entry: entry_id,
                 kind: CachedBatchType::from(&not_inserted),
@@ -1024,6 +1075,18 @@ impl LiquidCache {
         &self.reads
     }
 
+    /// [`Self::try_insert_over`] with no slot to replace.
+    #[cfg(test)]
+    fn try_insert<'a>(
+        &'a self,
+        entry_id: EntryID,
+        identity: u64,
+        to_insert: CacheEntry,
+        write: Option<DiskWrite<'a>>,
+    ) -> Result<Orphan<'a>, CacheEntry> {
+        self.try_insert_over(entry_id, identity, to_insert, write, None)
+    }
+
     /// Install `to_insert` under `entry_id`, if the memory budget allows.
     ///
     /// `write` is the write that put `to_insert`'s object, if this insert's
@@ -1035,12 +1098,21 @@ impl LiquidCache {
     /// object over the record's, the charge is released. Otherwise the
     /// record's object is left unnamed, and the charge is returned as an
     /// [`Orphan`] for the caller to reclaim.
-    fn try_insert<'a>(
+    ///
+    /// With `over`, the install goes in only over a slot it holds for
+    /// ([`ArtIndex::replace_if`]): **a write made from what a key held never
+    /// brings back what was removed since.** A spill, an eviction's
+    /// transcode, a background transcode and a promotion each read the key,
+    /// then install what they made of it; a removal or a newer write
+    /// between the two wins, and the install is refused as a full budget
+    /// refuses it.
+    fn try_insert_over<'a>(
         &'a self,
         entry_id: EntryID,
         identity: u64,
         to_insert: CacheEntry,
         write: Option<DiskWrite<'a>>,
+        over: Over<'_>,
     ) -> Result<Orphan<'a>, CacheEntry> {
         debug_assert!(
             write.is_some() || Self::charged_bytes(&to_insert).is_none(),
@@ -1094,10 +1166,14 @@ impl LiquidCache {
             self.budget.charge_memory(unreserved);
         }
         let cached_batch_type = CachedBatchType::from(&to_insert);
-        let displaced = match self.index.insert(&entry_id, identity, to_insert) {
+        let installed = match over {
+            Some(over) => self.index.replace_if(&entry_id, identity, to_insert, over),
+            None => self.index.insert(&entry_id, identity, to_insert),
+        };
+        let displaced = match installed {
             Ok(displaced) => displaced,
-            // The index could not allocate: refused as a full budget, with
-            // the charge given back.
+            // The index could not allocate, or the slot `over` was given for
+            // is gone: refused as a full budget, with the charge given back.
             Err(refused) => {
                 self.budget.release_memory(new_memory_size);
                 return Err(refused);
@@ -1450,7 +1526,11 @@ impl LiquidCache {
                 };
                 let (entry, identity) = (victim.entry, victim.identity);
                 let installed = next.clone();
-                match self.try_insert(entry, identity, next, None) {
+                // Only over the entry this eviction read: one removed since
+                // stays removed.
+                let read = victim.current.clone();
+                let over = |slot: &Slot| holds_memory(slot, identity, &read);
+                match self.try_insert_over(entry, identity, next, None, Some(&over)) {
                     Ok(orphan) => {
                         victim.current = installed;
                         self.reclaim(orphan).await;
@@ -1593,21 +1673,13 @@ impl LiquidCache {
             // **A record goes in only over the memory entry it was spilled
             // from.** The write ran without the index: a removal or a newer
             // write of the key meanwhile wins, and the record, were it
-            // installed, would bring back what was removed. Removals that
-            // must not be undone take this chunk's lock
-            // ([`Self::remove_inserted`]), which is held from this check to
-            // the install. Its write is dropped instead: the charge goes back
-            // and the object is left to [`StrayObjects`].
-            let spilled = self.index.get(&entry).is_some_and(|slot| {
-                slot.belongs_to(identity) && same_memory_entry(&slot.entry, current)
-            });
-            if !spilled {
-                drop(write);
-                continue;
-            }
-            // A disk record always installs (see `try_insert`); were it
-            // refused, dropping the write would give its charge back.
-            if let Ok(orphan) = self.try_insert(entry, identity, record, Some(write)) {
+            // installed, would bring back what was removed. Refused, its
+            // write is dropped: the charge goes back and the object is left
+            // to [`StrayObjects`].
+            let over = |slot: &Slot| holds_memory(slot, identity, current);
+            if let Ok(orphan) =
+                self.try_insert_over(entry, identity, record, Some(write), Some(&over))
+            {
                 orphans.push(orphan);
             }
         }
@@ -1647,7 +1719,18 @@ impl LiquidCache {
                 cached: cached_type,
                 new: new_type,
             });
-            let _ = self.insert_inner(*entry_id, identity, new_entry).await;
+            // Only over what was read: an entry removed since stays removed.
+            let over = |slot: &Slot| match cached {
+                CacheEntry::DiskArrow { .. } | CacheEntry::DiskLiquid { .. } => {
+                    holds_disk(slot, identity)
+                }
+                CacheEntry::MemoryArrow(_) | CacheEntry::MemoryLiquid(_) => {
+                    holds_memory(slot, identity, cached)
+                }
+            };
+            let _ = self
+                .insert_over(*entry_id, identity, new_entry, Some(&over))
+                .await;
         }
     }
 
@@ -2105,7 +2188,13 @@ impl LiquidCache {
                         continue;
                     }
                 };
-                if self.insert_inner(*entry, identity, decoded).await.is_ok() {
+                // Only over the record read: one removed since stays so.
+                let over = |slot: &Slot| holds_disk(slot, identity);
+                if self
+                    .insert_over(*entry, identity, decoded, Some(&over))
+                    .await
+                    .is_ok()
+                {
                     installed += 1;
                 }
             }
@@ -2163,29 +2252,24 @@ impl LiquidCache {
     /// Take `entries`, inserted for `identity` by a chunk insert that was
     /// refused, out of whichever tier they reached, for good.
     ///
-    /// A memory entry is removed under its chunk's lock, so a spill of it
-    /// whose write is under way installs no record over the removal
-    /// ([`Self::spill_chunk`]); a disk record is removed as an evicted one
-    /// is. Each entry is looked at again until `identity` holds nothing
-    /// under its key, so an entry that moved between tiers meanwhile is
-    /// taken too. One chunk's lock is held at a time, never across entries.
+    /// A memory entry is removed as an evicted one is, a disk record under
+    /// its chunk's lock. Nothing made from the entry before brings it back
+    /// ([`Self::try_insert_over`]), and each entry is looked at again until
+    /// `identity` holds nothing under its key, so an entry a spill or a
+    /// promotion moved between tiers meanwhile is taken too. One chunk's
+    /// lock is held at a time, never across entries.
     async fn remove_inserted(&self, entries: &[EntryID], identity: u64) {
         for entry in entries {
-            loop {
-                let key_lock = self.disk_key_locks.lock(entry).await;
-                let Some(slot) = self
-                    .index
-                    .get(entry)
-                    .filter(|slot| slot.belongs_to(identity))
-                else {
-                    break;
-                };
-                if Self::charged_bytes(&slot.entry).is_none() {
+            while let Some(slot) = self
+                .index
+                .get(entry)
+                .filter(|slot| slot.belongs_to(identity))
+            {
+                if Self::charged_bytes(&slot.entry).is_some() {
+                    self.remove_disk_record(*entry, Some(identity)).await;
+                } else {
                     self.drop_memory_victim(*entry, &slot.entry);
-                    continue;
                 }
-                drop(key_lock);
-                self.remove_disk_record(*entry, Some(identity)).await;
             }
         }
     }
@@ -3986,30 +4070,6 @@ mod tests {
 
         assert!(!cache.contains(&entry, 7));
         cache.delete_strays().await;
-        assert_disk_matches_index(&cache, &store).await;
-    }
-
-    /// An owner's removal of a memory entry waits for its chunk's lock,
-    /// which a spill of the chunk holds from its check to its install.
-    #[tokio::test]
-    async fn a_removal_waits_for_a_spill_holding_its_chunk() {
-        let entry = EntryID::from(946usize);
-        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
-        let (cache, store, _directory) = cache_over_counted_store(1 << 20, 1 << 20).await;
-        cache.insert(entry, 7, array).await.unwrap();
-
-        let spilling = cache.disk_key_locks.lock(&entry).await;
-        let entries = [entry];
-        let mut removal = std::pin::pin!(cache.remove_inserted(&entries, 7));
-        assert!(
-            poll_once(removal.as_mut()).is_pending(),
-            "the removal went ahead while a spill held its chunk"
-        );
-        assert!(cache.contains(&entry, 7));
-
-        drop(spilling);
-        removal.await;
-        assert!(!cache.contains(&entry, 7));
         assert_disk_matches_index(&cache, &store).await;
     }
 
