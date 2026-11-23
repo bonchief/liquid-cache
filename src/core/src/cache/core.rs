@@ -247,6 +247,7 @@ struct TierEvents {
     dropped_from_memory: std::sync::atomic::AtomicU64,
     dropped_from_disk: std::sync::atomic::AtomicU64,
     promoted: std::sync::atomic::AtomicU64,
+    retired: std::sync::atomic::AtomicU64,
 }
 
 impl TierEvents {
@@ -291,6 +292,9 @@ pub struct TierCounters {
     pub chunks_dropped_from_disk: u64,
     /// Chunks read back from disk into memory by [`LiquidCache::promote`].
     pub chunks_promoted: u64,
+    /// Chunks taken out of memory or disk, unspilled, by
+    /// [`LiquidCache::drop_identities`].
+    pub chunks_retired: u64,
     /// Disk reads whose object's header or directory did not match.
     pub disk_mismatches: u64,
 }
@@ -2145,6 +2149,44 @@ impl LiquidCache {
         Ok(())
     }
 
+    /// Take every entry held for one of `identities` out of memory and disk,
+    /// dropping it rather than spilling it: for an owner that knows nothing
+    /// will read those identities' data again worth keeping. Returns how
+    /// many chunks lost an entry.
+    ///
+    /// **It holds no lock across entries.** The index is walked once for
+    /// the keys, then each entry is removed as an evicted one is, under its
+    /// own key's lock alone, so reads and inserts of every other entry go on
+    /// beside it. A read of a removed entry misses, as it would after an
+    /// eviction; an entry inserted for one of `identities` after the walk
+    /// is the owner's to remove ([`Self::remove_entries`]).
+    pub async fn drop_identities(&self, identities: &ahash::AHashSet<u64>) -> usize {
+        if identities.is_empty() {
+            return 0;
+        }
+        let mut doomed: Vec<(EntryID, u64)> = Vec::new();
+        self.index.for_each(|entry, slot| {
+            if identities.contains(&slot.identity) {
+                doomed.push((*entry, slot.identity));
+            }
+        });
+        let chunks: ahash::AHashSet<EntryID> = doomed
+            .iter()
+            .map(|(entry, _)| self.chunk_of(entry))
+            .collect();
+        for (entry, identity) in doomed {
+            self.remove_inserted(&[entry], identity).await;
+        }
+        TierEvents::add(&self.events.retired, chunks.len() as u64);
+        chunks.len()
+    }
+
+    /// Take `entries` held for `identity` out of whichever tier holds them,
+    /// dropped, never spilled.
+    pub async fn remove_entries(&self, entries: &[EntryID], identity: u64) {
+        self.remove_inserted(entries, identity).await;
+    }
+
     /// Take `entries`, inserted for `identity` by a chunk insert that was
     /// refused, out of whichever tier they reached.
     async fn remove_inserted(&self, entries: &[EntryID], identity: u64) {
@@ -2177,6 +2219,7 @@ impl LiquidCache {
             chunks_dropped_from_memory: TierEvents::load(&self.events.dropped_from_memory),
             chunks_dropped_from_disk: TierEvents::load(&self.events.dropped_from_disk),
             chunks_promoted: TierEvents::load(&self.events.promoted),
+            chunks_retired: TierEvents::load(&self.events.retired),
             disk_mismatches: self.store.mismatches(),
         }
     }

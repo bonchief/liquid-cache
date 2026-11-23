@@ -11,6 +11,13 @@
 //! (file, row group or column) refers to it, and the cache holds no entry
 //! for its identity. Until then its registration, and the lineage hints kept
 //! under its slot, stay.
+//!
+//! A file can be *retired* first ([`FileRegistry::retire`]): its owner knows
+//! no read of it is worth caching any more. A retired registration keeps its
+//! slot until it is forgotten, but [`FileRegistry::key`] no longer finds it,
+//! and registering the file again gives it a fresh identity on that slot, so
+//! nothing filed under the retired identity is ever served to a later
+//! handle.
 
 use std::sync::Arc;
 
@@ -100,6 +107,7 @@ struct RegisteredFile {
     /// Bumped on every registration, so a sweep can tell that a handle was
     /// created (and possibly dropped again) while it scanned the cache.
     registrations: u64,
+    retired: bool,
 }
 
 /// A file a sweep may forget, as it was when the sweep started.
@@ -139,7 +147,17 @@ impl FileRegistry {
     pub(crate) fn register(&mut self, identity: ParquetFileIdentity) -> (FileKey, FileLease, bool) {
         if let Some(file) = self.files.get_mut(&identity) {
             file.registrations += 1;
-            return (file.key, file.lease.clone(), false);
+            if !file.retired {
+                return (file.key, file.lease.clone(), false);
+            }
+            // Its old identity's entries are gone or going: the file starts
+            // over on its slot, under an identity none of them carry, with
+            // no decoding pinned.
+            file.retired = false;
+            file.key.identity = self.next_identity;
+            self.next_identity += 1;
+            file.lease = FileLease::default();
+            return (file.key, file.lease.clone(), true);
         }
         let file_identity = self.next_identity;
         self.next_identity += 1;
@@ -167,14 +185,31 @@ impl FileRegistry {
                 key,
                 lease: lease.clone(),
                 registrations: 0,
+                retired: false,
             },
         );
         (key, lease, true)
     }
 
-    /// Where `identity`'s entries live, if it is registered.
+    /// Where `identity`'s entries live, if it is registered and not retired.
     pub(crate) fn key(&self, identity: &ParquetFileIdentity) -> Option<FileKey> {
-        self.files.get(identity).map(|file| file.key)
+        self.files
+            .get(identity)
+            .filter(|file| !file.retired)
+            .map(|file| file.key)
+    }
+
+    /// Retire every registered file `dead` names: the key identities whose
+    /// entries the cache should now drop.
+    pub(crate) fn retire(&mut self, dead: impl Fn(&ParquetFileIdentity) -> bool) -> Vec<u64> {
+        self.files
+            .iter_mut()
+            .filter(|(identity, file)| !file.retired && dead(identity))
+            .map(|(_, file)| {
+                file.retired = true;
+                file.key.identity
+            })
+            .collect()
     }
 
     /// How many files are registered.

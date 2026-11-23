@@ -196,7 +196,10 @@ impl ChunkClock {
                     ChunkRecord {
                         queue,
                         stamp,
-                        referenced: false,
+                        // A chunk just filled into memory has its chance
+                        // before the hand takes it: one already read again
+                        // since its fill is no likelier to be read next.
+                        referenced: tier == Tier::Memory,
                         batches: vec![(entry, arrow)],
                     },
                 );
@@ -316,8 +319,11 @@ impl ChunkClock {
 /// The cache moves those batches to disk, or drops them, together.
 ///
 /// A hit on any batch sets its chunk's reference bit in the tier it was
-/// served from; the search passes over a referenced chunk once. A batch
-/// that moves from disk to memory arrives in a fresh, cold memory record.
+/// served from; the search passes over a referenced chunk once. **A chunk
+/// filed in memory starts referenced**, so the hand passes a chunk just
+/// filled once before it can take it, as it would one read since: a chunk
+/// just filled is taken only after every chunk filed before it in its
+/// queue and not read since. A chunk filed on disk starts cold.
 #[derive(Debug, Default)]
 pub struct LiquidPolicy {
     inner: Mutex<ChunkClock>,
@@ -456,6 +462,33 @@ mod tests {
         assert_eq!(policy.find_disk_victim(1), vec![disk_old]);
         policy.notify_remove(&disk_new);
         assert!(policy.find_disk_victim(1).is_empty());
+    }
+
+    #[test]
+    fn test_a_fill_is_not_the_first_victim_beside_an_older_read_chunk() {
+        let policy = LiquidPolicy::new();
+        let older = entry(1);
+        let filled = entry(2);
+
+        policy.notify_insert(&older, CachedBatchType::MemoryLiquid);
+        policy.notify_access(&older, CachedBatchType::MemoryLiquid);
+        policy.notify_insert(&filled, CachedBatchType::MemoryLiquid);
+
+        assert_eq!(policy.find_memory_victim(1), vec![older]);
+        assert_eq!(policy.find_memory_victim(1), vec![filled]);
+    }
+
+    #[test]
+    fn test_a_disk_chunk_starts_cold() {
+        let policy = LiquidPolicy::new();
+        let first = entry(1);
+        let second = entry(2);
+
+        policy.notify_insert(&first, CachedBatchType::DiskLiquid);
+        policy.notify_insert(&second, CachedBatchType::DiskLiquid);
+        policy.notify_access(&first, CachedBatchType::DiskLiquid);
+
+        assert_eq!(policy.find_disk_victim(1), vec![second]);
     }
 
     #[test]

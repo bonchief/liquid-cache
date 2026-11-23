@@ -37,6 +37,9 @@ pub enum FillError {
     /// decodes it to: a scan that types that column otherwise used it first.
     /// Only that column is refused; the file's other columns fill as usual.
     Schema,
+    /// The file was retired while the chunk went in
+    /// ([`super::LiquidCacheParquet::retire`]); none of it was kept.
+    Retired,
 }
 
 impl std::fmt::Display for FillError {
@@ -51,6 +54,7 @@ impl std::fmt::Display for FillError {
                 out,
                 "the column is cached decoded to another type than this fill's schema"
             ),
+            Self::Retired => write!(out, "the file was retired while the column chunk went in"),
         }
     }
 }

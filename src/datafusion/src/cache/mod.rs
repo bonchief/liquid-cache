@@ -984,11 +984,38 @@ impl LiquidCacheParquet {
         }
         drop(arrays);
         let count = batches.len();
+        let entries: Vec<EntryID> = batches.iter().map(|(entry, _)| *entry).collect();
         self.cache_store
             .insert_chunk(cached.key.identity, batches)
             .await
             .map_err(|_| FillError::Full)?;
+        // A file retired while this fill decoded or inserted keeps nothing:
+        // the retirement's walk either saw these entries and dropped them,
+        // or ran before they were in, and then the registry, which retired
+        // the file first, no longer names this fill's key.
+        if self.files().key(&file) != Some(cached.key) {
+            self.cache_store
+                .remove_entries(&entries, cached.key.identity)
+                .await;
+            return Err(FillError::Retired);
+        }
         Ok(count)
+    }
+
+    /// Retire every file `dead` names: drop all it holds, in memory and on
+    /// disk, without spilling, and serve nothing filed for it before to any
+    /// later handle. Returns how many chunks were dropped.
+    ///
+    /// For an owner that knows these files will not be read again in a way
+    /// worth caching, such as files a newer version of their table no longer
+    /// lists. A read that is under way when its file is retired still reads
+    /// correctly: a batch it finds gone it reads from Parquet, as after an
+    /// eviction. A file registered again after its retirement starts empty,
+    /// under a fresh identity, and fills as any new file does. A fill that
+    /// was inserting as its file was retired takes its chunk out again.
+    pub async fn retire(&self, dead: impl Fn(&ParquetFileIdentity) -> bool) -> usize {
+        let identities: ahash::AHashSet<u64> = self.files().retire(dead).into_iter().collect();
+        self.cache_store.drop_identities(&identities).await
     }
 
     /// Read column `column` of row group `row_group` of `file`, `rows` rows,
@@ -2000,6 +2027,46 @@ mod fill_tests {
         // A chunk the cache holds whole already is left as it is.
         let again = fill(&cache, &metadata, 0, 0, chunk(&bytes, &metadata, 0, 0)).await;
         assert_eq!(again.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn retire_drops_memory_and_disk_and_starts_the_file_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache(dir.path()).await;
+        let (bytes, metadata) = file();
+        let groups = [(0, ROWS), (1, ROWS)];
+        fill(&cache, &metadata, 0, 0, chunk(&bytes, &metadata, 0, 0))
+            .await
+            .unwrap();
+        cache.flush_data().await.unwrap();
+        fill(&cache, &metadata, 0, 1, chunk(&bytes, &metadata, 0, 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.holds_all(&identity(), &groups, &[0, 1]),
+            [true, false]
+        );
+        let old = cache.register_or_get_file(identity(), schema());
+
+        // Another file is left alone.
+        assert_eq!(cache.retire(|file| *file != identity()).await, 0);
+        assert_eq!(cache.retire(|file| *file == identity()).await, 2);
+        assert_eq!(cache.holds_all(&identity(), &groups, &[0]), [false, false]);
+        assert_eq!(cache.memory_usage_bytes(), 0);
+        assert_eq!(cache.disk_usage_bytes(), 0);
+        assert_eq!(cache.counters().cache.chunks_retired, 2);
+        // A handle from before finds nothing.
+        let column = old.create_row_group(0, vec![]).get_column(0).unwrap();
+        assert!(!column.contains(BatchID::from_raw(0)));
+        // A retired file is retired once.
+        assert_eq!(cache.retire(|file| *file == identity()).await, 0);
+
+        // Filled again, the file starts over under a fresh identity.
+        let filled = fill(&cache, &metadata, 0, 0, chunk(&bytes, &metadata, 0, 0)).await;
+        assert_eq!(filled.unwrap(), ROWS / BATCH);
+        assert_eq!(cache.holds_all(&identity(), &groups, &[0]), [true, false]);
+        let fresh = cache.register_or_get_file(identity(), schema());
+        assert_ne!(fresh.key.identity, old.key.identity);
     }
 
     #[tokio::test]
