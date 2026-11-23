@@ -1578,7 +1578,7 @@ impl LiquidCache {
                     Self::form_of(record),
                     bytes.clone(),
                 ));
-                records.push((victim.entry, record.clone()));
+                records.push((victim.entry, &victim.current, record.clone()));
             }
         }
         let ChunkWrite { key_lock, members } = match self.write_chunk(identity, batches).await {
@@ -1589,7 +1589,22 @@ impl LiquidCache {
             }
         };
         let mut orphans = Vec::new();
-        for ((entry, record), write) in records.into_iter().zip(members) {
+        for ((entry, current, record), write) in records.into_iter().zip(members) {
+            // **A record goes in only over the memory entry it was spilled
+            // from.** The write ran without the index: a removal or a newer
+            // write of the key meanwhile wins, and the record, were it
+            // installed, would bring back what was removed. Removals that
+            // must not be undone take this chunk's lock
+            // ([`Self::remove_inserted`]), which is held from this check to
+            // the install. Its write is dropped instead: the charge goes back
+            // and the object is left to [`StrayObjects`].
+            let spilled = self.index.get(&entry).is_some_and(|slot| {
+                slot.belongs_to(identity) && same_memory_entry(&slot.entry, current)
+            });
+            if !spilled {
+                drop(write);
+                continue;
+            }
             // A disk record always installs (see `try_insert`); were it
             // refused, dropping the write would give its charge back.
             if let Ok(orphan) = self.try_insert(entry, identity, record, Some(write)) {
@@ -2146,16 +2161,31 @@ impl LiquidCache {
     }
 
     /// Take `entries`, inserted for `identity` by a chunk insert that was
-    /// refused, out of whichever tier they reached.
+    /// refused, out of whichever tier they reached, for good.
+    ///
+    /// A memory entry is removed under its chunk's lock, so a spill of it
+    /// whose write is under way installs no record over the removal
+    /// ([`Self::spill_chunk`]); a disk record is removed as an evicted one
+    /// is. Each entry is looked at again until `identity` holds nothing
+    /// under its key, so an entry that moved between tiers meanwhile is
+    /// taken too. One chunk's lock is held at a time, never across entries.
     async fn remove_inserted(&self, entries: &[EntryID], identity: u64) {
         for entry in entries {
-            let Some(slot) = self.index.get_for(entry, identity) else {
-                continue;
-            };
-            if Self::charged_bytes(&slot.entry).is_some() {
+            loop {
+                let key_lock = self.disk_key_locks.lock(entry).await;
+                let Some(slot) = self
+                    .index
+                    .get(entry)
+                    .filter(|slot| slot.belongs_to(identity))
+                else {
+                    break;
+                };
+                if Self::charged_bytes(&slot.entry).is_none() {
+                    self.drop_memory_victim(*entry, &slot.entry);
+                    continue;
+                }
+                drop(key_lock);
                 self.remove_disk_record(*entry, Some(identity)).await;
-            } else {
-                self.drop_memory_victim(*entry, &slot.entry);
             }
         }
     }
@@ -3928,6 +3958,58 @@ mod tests {
         removal.await;
 
         assert!(!cache.contains(&entry, 0));
+        assert_disk_matches_index(&cache, &store).await;
+    }
+
+    /// An eviction picked an entry in memory and is spilling it; before its
+    /// record goes in, an owner removes the entry for good. The record must
+    /// not bring it back: it installs nothing, gives its charge back and
+    /// leaves its object to be deleted.
+    #[tokio::test]
+    async fn a_spill_brings_back_no_entry_removed_while_it_wrote() {
+        let entry = EntryID::from(945usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let (cache, store, _directory) = cache_over_counted_store(1 << 20, 1 << 20).await;
+        cache.insert(entry, 7, array.clone()).await.unwrap();
+        let current = cache.index().get(&entry).unwrap().entry.clone();
+        cache.remove_inserted(&[entry], 7).await;
+
+        let (record, bytes) = arrow_spill(&array);
+        cache
+            .spill_chunk(vec![Victim {
+                entry,
+                identity: 7,
+                current,
+                step: Step::Spill { record, bytes },
+            }])
+            .await;
+
+        assert!(!cache.contains(&entry, 7));
+        cache.delete_strays().await;
+        assert_disk_matches_index(&cache, &store).await;
+    }
+
+    /// An owner's removal of a memory entry waits for its chunk's lock,
+    /// which a spill of the chunk holds from its check to its install.
+    #[tokio::test]
+    async fn a_removal_waits_for_a_spill_holding_its_chunk() {
+        let entry = EntryID::from(946usize);
+        let array: ArrayRef = Arc::new(Int32Array::from_iter_values(0..256));
+        let (cache, store, _directory) = cache_over_counted_store(1 << 20, 1 << 20).await;
+        cache.insert(entry, 7, array).await.unwrap();
+
+        let spilling = cache.disk_key_locks.lock(&entry).await;
+        let entries = [entry];
+        let mut removal = std::pin::pin!(cache.remove_inserted(&entries, 7));
+        assert!(
+            poll_once(removal.as_mut()).is_pending(),
+            "the removal went ahead while a spill held its chunk"
+        );
+        assert!(cache.contains(&entry, 7));
+
+        drop(spilling);
+        removal.await;
+        assert!(!cache.contains(&entry, 7));
         assert_disk_matches_index(&cache, &store).await;
     }
 
