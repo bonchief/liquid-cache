@@ -20,11 +20,17 @@ event=eviction_victim entry=2
 event=insert_success entry=2 kind=MemoryLiquid
 event=insert_success entry=3 kind=MemoryArrow
 event=insert_failed entry=4 kind=MemoryArrow
-event=eviction_begin victims=[3]
+event=eviction_begin victims=[0,3]
+event=eviction_victim entry=0
+event=io_write entry=0 kind=DiskLiquid bytes=[bytes]
+event=insert_success entry=0 kind=DiskLiquid
 event=eviction_victim entry=3
 event=insert_success entry=3 kind=MemoryLiquid
 event=insert_success entry=4 kind=MemoryArrow
-event=read entry=0 selection=false expr=None cached=MemoryLiquid
+event=read entry=0 selection=false expr=None cached=DiskLiquid
+event=io_read_liquid entry=0 bytes=[bytes]
+event=hydrate entry=0 cached=DiskLiquid new=MemoryLiquid
+event=insert_success entry=0 kind=MemoryLiquid
 event=read entry=1 selection=false expr=None cached=MemoryLiquid
 event=read entry=2 selection=false expr=None cached=MemoryLiquid
 event=read entry=3 selection=false expr=None cached=MemoryLiquid

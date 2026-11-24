@@ -7,9 +7,10 @@ use crate::{
 
 use super::ChunkCounts;
 
-/// The queue a chunk waits in. Memory chunks holding any Arrow batch go
-/// first, being the cheapest to rebuild, then memory chunks holding only
-/// Liquid ones; chunks on disk wait in their own queue.
+/// The queue a chunk waits in. Among chunks equally cold, memory chunks
+/// holding any Arrow batch go first, being the cheapest to rebuild, then
+/// memory chunks holding only Liquid ones; chunks on disk wait in their own
+/// queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum QueueKind {
     Arrow,
@@ -260,42 +261,64 @@ impl ChunkClock {
         }
     }
 
-    /// Whole chunks from `queues`, in that order, until they hold at least
-    /// `want` batches. Each chunk's record leaves the policy with its
-    /// batches.
+    /// Whole chunks from `queues` until they hold at least `want` batches.
+    /// Each chunk's record leaves the policy with its batches.
     ///
-    /// CLOCK: a referenced chunk at the hand is passed over once, its bit
-    /// cleared and its token moved to the back. A chunk read once is thus
-    /// evicted before any chunk read again since it was filed, whatever its
-    /// age. Each pass clears a bit, so the search ends.
+    /// CLOCK across queues: **a chunk referenced since the hand last passed
+    /// it is never a victim while an unreferenced chunk is in any of
+    /// `queues`.** The hand makes at most two rounds. In each it turns each
+    /// queue, in the order given, once around: a referenced chunk is passed
+    /// over, its bit cleared and its token moved to the back; an
+    /// unreferenced one is taken. Round one so takes only chunks cold when
+    /// the search began, `queues`' order deciding among them; it clears every
+    /// bit it passes, so round two takes the rest in the same order. A chunk
+    /// read once is thus evicted before any chunk read again since it was
+    /// filed, whatever its age or queue.
+    ///
+    /// The search pops each token present when its turn of a queue begins
+    /// at most once per round, so it visits at most twice the tokens
+    /// `queues` hold ([`Self::search`]).
     fn victims(&mut self, queues: &[QueueKind], want: usize) -> Vec<EntryID> {
+        self.search(queues, want).0
+    }
+
+    /// [`Self::victims`], and how many tokens the hand popped.
+    fn search(&mut self, queues: &[QueueKind], want: usize) -> (Vec<EntryID>, usize) {
         let mut victims = Vec::new();
-        for &queue in queues {
-            while victims.len() < want {
-                let Some((chunk, stamp)) = self.queues[queue.index()].pop_front() else {
-                    break;
-                };
-                let key = (chunk, queue.tier());
-                let fresh = self.stamp();
-                let Some(record) = self.records.get_mut(&key) else {
-                    continue;
-                };
-                if record.stamp != stamp || record.queue != queue {
-                    continue;
-                }
-                if record.referenced {
-                    record.referenced = false;
-                    record.stamp = fresh;
-                    self.queues[queue.index()].push_back((chunk, fresh));
-                    continue;
-                }
-                if let Some(record) = self.records.remove(&key) {
-                    self.counts[queue.index()] = self.counts[queue.index()].saturating_sub(1);
-                    victims.extend(record.batches.into_iter().map(|(id, _)| id));
+        let mut visited = 0;
+        for _round in 0..2 {
+            for &queue in queues {
+                let turn = self.queues[queue.index()].len();
+                for _ in 0..turn {
+                    if victims.len() >= want {
+                        return (victims, visited);
+                    }
+                    let Some((chunk, stamp)) = self.queues[queue.index()].pop_front() else {
+                        break;
+                    };
+                    visited += 1;
+                    let key = (chunk, queue.tier());
+                    let fresh = self.stamp();
+                    let Some(record) = self.records.get_mut(&key) else {
+                        continue;
+                    };
+                    if record.stamp != stamp || record.queue != queue {
+                        continue;
+                    }
+                    if record.referenced {
+                        record.referenced = false;
+                        record.stamp = fresh;
+                        self.queues[queue.index()].push_back((chunk, fresh));
+                        continue;
+                    }
+                    if let Some(record) = self.records.remove(&key) {
+                        self.counts[queue.index()] = self.counts[queue.index()].saturating_sub(1);
+                        victims.extend(record.batches.into_iter().map(|(id, _)| id));
+                    }
                 }
             }
         }
-        victims
+        (victims, visited)
     }
 
     fn counts(&self) -> ChunkCounts {
@@ -310,6 +333,13 @@ impl ChunkClock {
 /// Cache policy that evicts whole column chunks by CLOCK, memory chunks
 /// holding Arrow first, then Liquid ones, and disk chunks in their own
 /// queue.
+///
+/// **Coldness comes before form.** The Arrow-first order holds only among
+/// chunks alike in their reference bit: a memory chunk read since the hand
+/// last passed it is taken only once no unreferenced memory chunk is left,
+/// in either queue. So a Liquid chunk nothing reads leaves memory before an
+/// Arrow chunk a scan reads, and a table being read takes memory from one
+/// that is not.
 ///
 /// **A chunk is evicted whole or not at all.** The policy files batches by
 /// their chunk (the entry id with the batch bits the cache names in
@@ -489,6 +519,129 @@ mod tests {
         policy.notify_access(&first, CachedBatchType::DiskLiquid);
 
         assert_eq!(policy.find_disk_victim(1), vec![second]);
+    }
+
+    #[test]
+    fn test_a_hot_arrow_chunk_outlives_a_cold_liquid_chunk() {
+        let policy = LiquidPolicy::new();
+        let first = entry(1);
+        let hot = entry(2);
+        let idle = entry(3);
+
+        policy.notify_insert(&first, CachedBatchType::MemoryArrow);
+        policy.notify_insert(&hot, CachedBatchType::MemoryArrow);
+        policy.notify_insert(&idle, CachedBatchType::MemoryLiquid);
+        // Every chunk was filed referenced: the hand passes all three once,
+        // then takes the first Arrow chunk.
+        assert_eq!(policy.find_memory_victim(1), vec![first]);
+
+        // Only `hot` is read since. The idle Liquid chunk goes first, though
+        // the hand meets the Arrow chunk first.
+        policy.notify_access(&hot, CachedBatchType::MemoryArrow);
+        assert_eq!(policy.find_memory_victim(1), vec![idle]);
+        assert_eq!(policy.find_memory_victim(1), vec![hot]);
+    }
+
+    #[test]
+    fn test_arrow_goes_before_liquid_among_cold_chunks() {
+        let policy = LiquidPolicy::new();
+        let liquid = entry(1);
+        let arrow = entry(2);
+
+        policy.notify_insert(&liquid, CachedBatchType::MemoryLiquid);
+        policy.notify_insert(&arrow, CachedBatchType::MemoryArrow);
+        // Both filed referenced; the first search clears both, then takes
+        // the Arrow chunk.
+        assert_eq!(policy.find_memory_victim(1), vec![arrow]);
+        assert_eq!(policy.find_memory_victim(1), vec![liquid]);
+    }
+
+    #[test]
+    fn test_no_referenced_chunk_is_taken_while_a_cold_one_is_left() {
+        // Inserts, reads and searches in a fixed pseudo-random order; before
+        // each search, the memory chunks unreferenced then. A victim is
+        // referenced only if none was.
+        let policy = LiquidPolicy::new();
+        let mut held: Vec<(EntryID, CachedBatchType)> = Vec::new();
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let mut id = 0;
+        for _ in 0..2_000 {
+            match next(4) {
+                0 | 1 => {
+                    id += 1;
+                    let kind = if next(2) == 0 {
+                        CachedBatchType::MemoryArrow
+                    } else {
+                        CachedBatchType::MemoryLiquid
+                    };
+                    policy.notify_insert(&entry(id), kind);
+                    held.push((entry(id), kind));
+                }
+                2 if !held.is_empty() => {
+                    let (chunk, kind) = held[next(held.len() as u64) as usize];
+                    policy.notify_access(&chunk, kind);
+                }
+                _ => {
+                    let cold: Vec<EntryID> = {
+                        let state = policy.state();
+                        state
+                            .records
+                            .iter()
+                            .filter(|((_, tier), record)| {
+                                *tier == Tier::Memory && !record.referenced
+                            })
+                            .map(|((chunk, _), _)| *chunk)
+                            .collect()
+                    };
+                    let victims = policy.find_memory_victim(1);
+                    if let Some(victim) = victims.first() {
+                        assert!(
+                            cold.is_empty() || cold.contains(victim),
+                            "took referenced {victim:?} while {cold:?} were cold"
+                        );
+                        held.retain(|(chunk, _)| chunk != victim);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_search_visits_at_most_twice_the_tokens() {
+        let policy = LiquidPolicy::new();
+        for id in 1..=100 {
+            let kind = if id % 2 == 0 {
+                CachedBatchType::MemoryLiquid
+            } else {
+                CachedBatchType::MemoryArrow
+            };
+            policy.notify_insert(&entry(id), kind);
+        }
+        // Every chunk referenced: the worst case for one search.
+        let mut state = policy.state();
+        let tokens = state.queues[QueueKind::Arrow.index()].len()
+            + state.queues[QueueKind::Liquid.index()].len();
+        let (victims, visited) = state.search(&QueueKind::MEMORY, 1);
+        assert_eq!(victims.len(), 1);
+        assert!(
+            visited <= 2 * tokens,
+            "visited {visited} of {tokens} tokens"
+        );
+        // Asking for more than is held ends after two rounds too.
+        let tokens = state.queues[QueueKind::Arrow.index()].len()
+            + state.queues[QueueKind::Liquid.index()].len();
+        let (victims, visited) = state.search(&QueueKind::MEMORY, 1_000);
+        assert_eq!(victims.len(), 99);
+        assert!(
+            visited <= 2 * tokens,
+            "visited {visited} of {tokens} tokens"
+        );
     }
 
     #[test]
