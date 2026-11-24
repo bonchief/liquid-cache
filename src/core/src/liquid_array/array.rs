@@ -12,6 +12,7 @@ use vortex_array::arrays::dict::{DictArrayExt, DictArraySlotsExt};
 use vortex_array::arrays::{ConstantArray, Dict, DictArray, VarBinView, VarBinViewArray};
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::{DType, Nullability};
+use vortex_array::optimizer::ArrayOptimizer;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::like::{Like, LikeOptions};
 use vortex_array::scalar_fn::fns::operators::Operator;
@@ -403,11 +404,7 @@ impl LiquidArray {
                 negated,
                 case_insensitive: false,
             };
-            return Some(
-                Like::try_new(array.clone(), pattern, options)
-                    .ok()?
-                    .into_array(),
-            );
+            return Self::like(array, pattern, options);
         }
 
         if let Some(like) = expr.downcast_ref::<LikeExpr>() {
@@ -446,11 +443,7 @@ impl LiquidArray {
         options: LikeOptions,
     ) -> Option<vortex_array::ArrayRef> {
         let pattern = self.constant(pattern, array.len())?;
-        Some(
-            Like::try_new(array.clone(), pattern, options)
-                .ok()?
-                .into_array(),
-        )
+        Self::like(array, pattern, options)
     }
 
     /// Whether `predicate` is a column compared with a literal, which
@@ -470,6 +463,45 @@ impl LiquidArray {
                         | DataFusionOperator::GtEq
                 )
             })
+    }
+
+    /// `array LIKE pattern`, over a dictionary of fewer values than rows
+    /// evaluated once per distinct value and mapped through its codes, and
+    /// over FSST-compressed rows on the rows decoded.
+    ///
+    /// Vortex expands a dictionary before a LIKE unless the expression is
+    /// reduced first, so every row matched its value again. On 244 batches
+    /// of ClickBench's URL, about 2.3 rows per value, the reduction cuts a
+    /// `'%google%'` mask from 6.1 to 2.8 ns per row for bytes and from 13.8
+    /// to 9.9 for text, whose values are decoded first. A dictionary of as
+    /// many values as rows, such as one a selective filter left, gains
+    /// nothing from it and matches per row.
+    fn like(
+        array: &vortex_array::ArrayRef,
+        pattern: vortex_array::ArrayRef,
+        options: LikeOptions,
+    ) -> Option<vortex_array::ArrayRef> {
+        // FSST matches a pattern on its compressed codes over three times
+        // slower than on the rows decoded: 75.8 against 22.9 ns per row on
+        // URLs made unique, whose entries are FSST alone.
+        let array = match array.is::<FSST>() {
+            true => {
+                let mut ctx = SESSION.create_execution_ctx();
+                array
+                    .clone()
+                    .execute::<VarBinViewArray>(&mut ctx)
+                    .ok()?
+                    .into_array()
+            }
+            false => array.clone(),
+        };
+        let like = Like::try_new(array.clone(), pattern, options)
+            .ok()?
+            .into_array();
+        match array.as_opt::<Dict>() {
+            Some(dict) if dict.values().len() < dict.codes().len() => like.optimize().ok(),
+            _ => Some(like),
+        }
     }
 
     fn try_eval_vortex_predicate(
@@ -1561,6 +1593,135 @@ mod tests {
                 liquid.array.display_tree().to_string()
             );
             assert_eq!(liquid.to_arrow_array().unwrap().as_ref(), array.as_ref());
+        }
+    }
+
+    /// A stand-in for Bonchief's byte search functions: the cache reads
+    /// them by name and never calls them.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct ByteSearch(&'static str, datafusion_expr_common::signature::Signature);
+
+    impl datafusion::logical_expr::ScalarUDFImpl for ByteSearch {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn signature(&self) -> &datafusion_expr_common::signature::Signature {
+            &self.1
+        }
+        fn return_type(&self, _: &[DataType]) -> datafusion_common::Result<DataType> {
+            Ok(DataType::Boolean)
+        }
+        fn invoke_with_args(
+            &self,
+            _: datafusion::logical_expr::ScalarFunctionArgs,
+        ) -> datafusion_common::Result<datafusion::logical_expr::ColumnarValue> {
+            datafusion_common::not_impl_err!("the cache evaluates {}", self.0)
+        }
+    }
+
+    fn byte_search(name: &'static str, needle: &[u8], negated: bool) -> LiquidExpr {
+        let signature = datafusion_expr_common::signature::Signature::any(
+            2,
+            datafusion_expr_common::signature::Volatility::Immutable,
+        );
+        let udf = Arc::new(datafusion::logical_expr::ScalarUDF::from(ByteSearch(
+            name, signature,
+        )));
+        let call: Arc<dyn PhysicalExpr> =
+            Arc::new(datafusion_physical_expr::ScalarFunctionExpr::new(
+                name,
+                udf,
+                vec![
+                    Arc::new(Column::new("c", 0)),
+                    Arc::new(Literal::new(ScalarValue::BinaryView(Some(needle.to_vec())))),
+                ],
+                Arc::new(Field::new(name, DataType::Boolean, true)),
+                Arc::new(datafusion_common::config::ConfigOptions::default()),
+            ));
+        let expr = match negated {
+            true => Arc::new(NotExpr::new(call)),
+            false => call,
+        };
+        LiquidExpr::try_new(expr, &DataType::BinaryView).unwrap()
+    }
+
+    /// What `binary_contains(c, needle)` answers for the rows `selection`
+    /// keeps, row by row.
+    fn contains_each_row(
+        array: &ArrayRef,
+        needle: &[u8],
+        negated: bool,
+        selection: &BooleanBuffer,
+    ) -> BooleanArray {
+        let filtered =
+            arrow::compute::filter(array, &BooleanArray::new(selection.clone(), None)).unwrap();
+        filtered
+            .as_any()
+            .downcast_ref::<BinaryViewArray>()
+            .unwrap()
+            .iter()
+            .map(|value| {
+                value.map(|value| {
+                    let found = needle.is_empty()
+                        || value.windows(needle.len()).any(|window| window == needle);
+                    found != negated
+                })
+            })
+            .collect()
+    }
+
+    /// A byte search on a dictionary of bytes matches each distinct value
+    /// once and answers as matching each row would, nulls and empty values
+    /// included, as does a dictionary of as many values as rows, which
+    /// matches per row.
+    #[test]
+    fn a_byte_search_on_a_dictionary_answers_as_each_row_does() {
+        let repeated = arrow::compute::cast(&repeated_text(), &DataType::BinaryView).unwrap();
+        let liquid = LiquidArray::from_arrow_array(&repeated).unwrap();
+        let dict = liquid.array.as_opt::<Dict>().expect("a dictionary");
+        assert!(dict.values().len() < dict.codes().len());
+
+        let unique: Vec<Option<Vec<u8>>> = (0..512)
+            .map(|row| match row % 97 {
+                0 => None,
+                1 => Some(Vec::new()),
+                _ => Some(format!("https://example.com/{row}?q=google{}", row % 3).into_bytes()),
+            })
+            .collect();
+        let unique: ArrayRef = Arc::new(BinaryViewArray::from(
+            unique.iter().map(Option::as_deref).collect::<Vec<_>>(),
+        ));
+        let distinct = import_array(&unique).unwrap();
+        let codes = (0..unique.len() as u32)
+            .collect::<vortex_buffer::Buffer<u32>>()
+            .into_array();
+        let every_value = LiquidArray {
+            array: DictArray::try_new(codes, distinct).unwrap().into_array(),
+            arrow_type: DataType::BinaryView,
+            memory_size: 0,
+        };
+
+        for (name, array, liquid) in [
+            ("repeated", &repeated, &liquid),
+            ("all distinct", &unique, &every_value),
+        ] {
+            let all = BooleanBuffer::new_set(array.len());
+            let [half, sparse] = selections(array.len());
+            for (needle, negated) in [
+                (&b"google"[..], false),
+                (b"google1", true),
+                (b"", false),
+                (b"%_", false),
+            ] {
+                let expr = byte_search("binary_contains", needle, negated);
+                for selection in [&all, &half, &sparse] {
+                    assert_eq!(
+                        liquid.try_eval_predicate(&expr, selection).unwrap(),
+                        contains_each_row(array, needle, negated, selection),
+                        "{name}: {needle:?}, negated {negated}"
+                    );
+                }
+            }
         }
     }
 }
