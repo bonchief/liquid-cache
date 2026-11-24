@@ -28,6 +28,31 @@ use crate::sync::Arc;
 
 // CacheStats and RuntimeStats moved to stats.rs
 
+/// Why an offer to promote a disk chunk stopped, or how many bytes it installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotionOutcome {
+    /// Some or all of the chunk was installed, weighted by its decoded bytes.
+    Installed(usize),
+    /// The chunk needs more bytes than remain in this promotion window.
+    WindowFit,
+    /// The chunk needs more bytes than the tier can hold.
+    TierFit,
+    /// A previously measured chunk exceeded the window limit before I/O.
+    KnownWindowFit,
+    /// A previously measured chunk exceeded the tier limit before I/O.
+    KnownTierFit,
+    /// The transient disk-read reservation was refused.
+    ReadBudget,
+    /// The requested identity no longer holds a readable disk record.
+    Missing,
+    /// The disk object or every decoded batch failed validation.
+    Unreadable,
+    /// One turn found too few cold chunks to make room.
+    NoColdVictims,
+    /// A concurrent change won while the promoted batches were installed.
+    InstallRefused,
+}
+
 /// Cache storage for liquid cache.
 ///
 /// # Identity
@@ -2114,19 +2139,32 @@ impl LiquidCache {
         let charge = |held: usize| self.reads.try_take(held.saturating_mul(2));
         match self.store.get_chunk_charged(*entry_id, key, charge).await {
             Ok(read) => Some(read),
-            Err(DiskError::NotFound | DiskError::Refused) => None,
-            // The object the record names is another identity's: the record
-            // can never be served, so it goes, and every later lookup for it
-            // (`holds_all` among them) misses rather than read and fall back.
-            Err(DiskError::Foreign) => {
-                self.drop_unreadable(*entry_id, identity).await;
+            Err(error) => {
+                self.disk_read_refusal(*entry_id, identity, error).await;
                 None
             }
-            Err(error) => {
+        }
+    }
+
+    async fn disk_read_refusal(
+        &self,
+        entry: EntryID,
+        identity: u64,
+        error: DiskError,
+    ) -> PromotionOutcome {
+        match error {
+            DiskError::NotFound => PromotionOutcome::Missing,
+            DiskError::Refused => PromotionOutcome::ReadBudget,
+            // An object of another identity makes this record a miss.
+            DiskError::Foreign => {
+                self.drop_unreadable(entry, identity).await;
+                PromotionOutcome::Missing
+            }
+            error => {
                 self.observer.on_disk_read_failure(&error);
                 drop(error);
-                self.drop_unreadable(*entry_id, identity).await;
-                None
+                self.drop_unreadable(entry, identity).await;
+                PromotionOutcome::Unreadable
             }
         }
     }
@@ -2280,32 +2318,81 @@ impl LiquidCache {
     /// disk record it was read from, so one removed or replaced meanwhile
     /// stays so.
     pub async fn promote_cold(&self, entry_id: EntryID, identity: u64, allowance: usize) -> usize {
-        if !self.is_on_disk(&entry_id, identity) {
-            return 0;
+        match self
+            .promote_cold_with_outcome(entry_id, identity, allowance)
+            .await
+        {
+            PromotionOutcome::Installed(bytes) => bytes,
+            _ => 0,
         }
-        let Some((object, _charge)) = self.read_object(&entry_id, identity).await else {
-            return 0;
+    }
+
+    /// Promote as in [`Self::promote_cold`], distinguishing each refusal.
+    /// A decoded lower bound belongs to the disk extent and its identity.
+    /// It can reject repeat offers before I/O while all batch names remain.
+    pub async fn promote_cold_with_outcome(
+        &self,
+        entry_id: EntryID,
+        identity: u64,
+        allowance: usize,
+    ) -> PromotionOutcome {
+        if !self.is_on_disk(&entry_id, identity) {
+            return PromotionOutcome::Missing;
+        }
+        let tier = self.config.max_memory_bytes();
+        let limit = allowance.min(tier);
+        let key = ObjectKey::new(self.chunk_of(&entry_id), identity);
+        let charge = |held: usize| self.reads.try_take(held.saturating_mul(2));
+        let (object, _charge, weight) = match self
+            .store
+            .get_chunk_for_promotion(entry_id, key, limit, charge)
+            .await
+        {
+            Ok(read) => read,
+            Err(DiskError::PromotionFit) if tier < allowance => {
+                return PromotionOutcome::KnownTierFit;
+            }
+            Err(DiskError::PromotionFit) => return PromotionOutcome::KnownWindowFit,
+            Err(error) => return self.disk_read_refusal(entry_id, identity, error).await,
         };
         let mut decoded = Vec::new();
+        let mut size = 0usize;
+        let mut unreadable = false;
         for (entry, form, bytes) in object.batches() {
             if !self.is_on_disk(&entry, identity) {
                 continue;
             }
             match Self::decode_form(form, Bytes::copy_from_slice(&bytes)) {
-                Ok(batch) => decoded.push((entry, batch)),
+                Ok(batch) => {
+                    size = size.saturating_add(batch.memory_usage_bytes());
+                    if size > limit {
+                        weight.remember(size);
+                        return if tier < allowance {
+                            PromotionOutcome::TierFit
+                        } else {
+                            PromotionOutcome::WindowFit
+                        };
+                    }
+                    decoded.push((entry, batch));
+                }
                 Err(error) => {
+                    unreadable = true;
                     self.observer.on_disk_read_failure(&error);
                     self.drop_unreadable(entry, identity).await;
                 }
             }
         }
         drop(object);
-        let size: usize = decoded
-            .iter()
-            .map(|(_, batch)| batch.memory_usage_bytes())
-            .sum();
-        if decoded.is_empty() || size > allowance || size > self.config.max_memory_bytes() {
-            return 0;
+        if decoded.is_empty() {
+            return if unreadable {
+                PromotionOutcome::Unreadable
+            } else {
+                PromotionOutcome::Missing
+            };
+        }
+        drop(weight);
+        if size > self.config.max_memory_bytes() {
+            return PromotionOutcome::TierFit;
         }
         // Room for the whole chunk first, so it moves whole or not at all.
         let mut turn = Turn::default();
@@ -2321,7 +2408,7 @@ impl LiquidCache {
                 self.cache_policy.find_cold_memory_victim(cnt, &mut turn)
             });
             if victims.is_empty() {
-                return 0;
+                return PromotionOutcome::NoColdVictims;
             }
             self.evict_victims(victims).await;
         }
@@ -2337,10 +2424,11 @@ impl LiquidCache {
                 installed += held;
             }
         }
-        if installed > 0 {
-            TierEvents::add(&self.events.promoted, 1);
+        if installed == 0 {
+            return PromotionOutcome::InstallRefused;
         }
-        installed
+        TierEvents::add(&self.events.promoted, 1);
+        PromotionOutcome::Installed(installed)
     }
 
     /// `array` in the form the cache keeps a fresh batch in: Liquid when it

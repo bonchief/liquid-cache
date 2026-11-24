@@ -183,6 +183,10 @@ impl ChunkObject {
             .map(|(id, form, range)| (*id, *form, self.payload.slice(range.clone())))
     }
 
+    pub(super) fn members(&self) -> usize {
+        self.directory.batches.len()
+    }
+
     /// The bytes the object's payload holds.
     pub fn len(&self) -> usize {
         self.payload.len()

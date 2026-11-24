@@ -56,6 +56,8 @@ pub enum DiskError {
     /// The caller of [`DiskStore::get_chunk_charged`] declined the read: no
     /// room to hold what it would allocate.
     Refused,
+    /// The decoded bytes already observed for a promotion exceed its limit.
+    PromotionFit,
 }
 
 impl std::fmt::Display for DiskError {
@@ -70,6 +72,7 @@ impl std::fmt::Display for DiskError {
             Self::Io(error) => write!(out, "disk tier I/O failed: {error}"),
             Self::Closed => out.write_str("the disk tier's I/O threads have stopped"),
             Self::Refused => out.write_str("the disk tier read was refused: no room to hold it"),
+            Self::PromotionFit => out.write_str("the decoded chunk exceeds the promotion limit"),
         }
     }
 }
@@ -354,11 +357,40 @@ impl DiskStore {
         chunk: ObjectKey,
         charge: impl FnOnce(usize) -> Option<T>,
     ) -> Result<(ChunkObject, T), DiskError> {
-        let (at, len) = self
-            .shared
-            .extents()
-            .pin_named(&entry)
-            .ok_or(DiskError::NotFound)?;
+        let (object, charged, _) = self.read_named(entry, chunk, None, charge).await?;
+        Ok((object, charged))
+    }
+
+    pub(super) async fn get_chunk_for_promotion<T>(
+        &self,
+        entry: EntryID,
+        chunk: ObjectKey,
+        limit: usize,
+        charge: impl FnOnce(usize) -> Option<T>,
+    ) -> Result<(ChunkObject, T, PromotionWeight), DiskError> {
+        let (object, charged, hold) = self.read_named(entry, chunk, Some(limit), charge).await?;
+        let weight = PromotionWeight {
+            hold,
+            identity: chunk.identity,
+            members: object.members(),
+        };
+        Ok((object, charged, weight))
+    }
+
+    async fn read_named<T>(
+        &self,
+        entry: EntryID,
+        chunk: ObjectKey,
+        limit: Option<usize>,
+        charge: impl FnOnce(usize) -> Option<T>,
+    ) -> Result<(ChunkObject, T, Hold), DiskError> {
+        let (at, len) = {
+            let mut extents = self.shared.extents();
+            if limit.is_some_and(|limit| extents.too_large(&entry, chunk.identity, limit)) {
+                return Err(DiskError::PromotionFit);
+            }
+            extents.pin_named(&entry).ok_or(DiskError::NotFound)?
+        };
         let hold = Hold {
             shared: Arc::clone(&self.shared),
             at,
@@ -369,11 +401,11 @@ impl DiskStore {
             .ok_or(DiskError::Corrupt)?;
         let charged = charge(held).ok_or(DiskError::Refused)?;
         let shared = Arc::clone(&self.shared);
-        let (buffer, payload) = self
+        let (buffer, payload, hold) = self
             .pool
             .run(move || {
-                let _reading = hold;
-                shared.read(chunk, at, len)
+                let (buffer, payload) = shared.read(chunk, at, len)?;
+                Ok::<_, DiskError>((buffer, payload, hold))
             })
             .await??;
         let payload = buffer.into_bytes(payload);
@@ -384,7 +416,7 @@ impl DiskStore {
                 return Err(DiskError::Corrupt);
             }
         };
-        Ok((ChunkObject::new(payload, directory), charged))
+        Ok((ChunkObject::new(payload, directory), charged, hold))
     }
 
     /// Forget `entry`'s object; whether it had one. Its extent is freed once
@@ -472,6 +504,24 @@ impl Shared {
                 Err(error)
             }
         }
+    }
+}
+
+/// Only the promotion that read the object can record its decoded weight.
+pub(super) struct PromotionWeight {
+    hold: Hold,
+    identity: u64,
+    members: usize,
+}
+
+impl PromotionWeight {
+    pub(super) fn remember(self, bytes: usize) {
+        self.hold.shared.extents().remember_decoded(
+            self.hold.at,
+            self.identity,
+            self.members,
+            bytes,
+        );
     }
 }
 

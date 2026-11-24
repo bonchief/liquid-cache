@@ -47,6 +47,9 @@ struct Extent {
     pins: u64,
     /// How many entries name it in `named`.
     names: u32,
+    /// Observed decoded bytes of still-named batches for one identity.
+    /// Membership changes discard the bound before a later promotion.
+    decoded: Option<(u64, usize)>,
 }
 
 impl Extents {
@@ -99,6 +102,7 @@ impl Extents {
                 len,
                 pins: 1,
                 names: 0,
+                decoded: None,
             },
         );
         self.used += len;
@@ -118,6 +122,7 @@ impl Extents {
         }
         if let Some(extent) = self.held.get_mut(&at) {
             extent.names = extent.names.saturating_add(1);
+            extent.decoded = None;
         }
         if let Some(old) = old {
             self.unname(old);
@@ -141,6 +146,31 @@ impl Extents {
         let extent = self.held.get_mut(&at)?;
         extent.pins += 1;
         Some((at, extent.len))
+    }
+
+    pub(super) fn too_large(&self, entry: &EntryID, identity: u64, limit: usize) -> bool {
+        self.named
+            .get(entry)
+            .and_then(|at| self.held.get(at))
+            .and_then(|extent| extent.decoded)
+            .is_some_and(|(owner, bytes)| owner == identity && bytes > limit)
+    }
+
+    /// Record a lower bound only while every member of the decoded object
+    /// still names this pinned extent. A removal may have reduced the weight.
+    pub(super) fn remember_decoded(
+        &mut self,
+        at: u64,
+        identity: u64,
+        members: usize,
+        bytes: usize,
+    ) {
+        if let Some(extent) = self.held.get_mut(&at)
+            && extent.names as usize == members
+        {
+            let prior = extent.decoded.filter(|(owner, _)| *owner == identity);
+            extent.decoded = Some((identity, bytes.max(prior.map_or(0, |(_, bytes)| bytes))));
+        }
     }
 
     /// Pin the extent at `at` once more. Only called while another pin holds
@@ -168,6 +198,7 @@ impl Extents {
             return;
         };
         extent.names = extent.names.saturating_sub(1);
+        extent.decoded = None;
         if extent.pins == 0 && extent.names == 0 {
             self.release(at);
         }
