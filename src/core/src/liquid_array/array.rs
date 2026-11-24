@@ -291,9 +291,12 @@ impl LiquidArray {
             .map_err(arrow_error)
     }
 
+    /// The rows `filter` keeps, with a dictionary's values decoded for the
+    /// read when `decode` is set (see [`Self::for_read`]).
     fn filtered_vortex(
         &self,
         filter: &BooleanBuffer,
+        decode: bool,
     ) -> Result<vortex_array::ArrayRef, ArrowError> {
         if filter.len() != self.len() {
             return Err(ArrowError::InvalidArgumentError(format!(
@@ -303,7 +306,11 @@ impl LiquidArray {
             )));
         }
         let mask = Mask::from_buffer(BitBuffer::from(filter.clone()));
-        self.for_read(filter.count_set_bits())
+        let array = match decode {
+            true => self.for_read(filter.count_set_bits()),
+            false => Ok(self.array.clone()),
+        };
+        array
             .and_then(|array| array.filter(mask))
             .map_err(arrow_error)
     }
@@ -446,6 +453,25 @@ impl LiquidArray {
         )
     }
 
+    /// Whether `predicate` is a column compared with a literal, which
+    /// [`Self::try_eval_predicate`] evaluates on the encoded values.
+    fn compares(predicate: &LiquidExpr) -> bool {
+        predicate
+            .physical_expr()
+            .downcast_ref::<BinaryExpr>()
+            .is_some_and(|binary| {
+                matches!(
+                    binary.op(),
+                    DataFusionOperator::Eq
+                        | DataFusionOperator::NotEq
+                        | DataFusionOperator::Lt
+                        | DataFusionOperator::LtEq
+                        | DataFusionOperator::Gt
+                        | DataFusionOperator::GtEq
+                )
+            })
+    }
+
     fn try_eval_vortex_predicate(
         &self,
         array: &vortex_array::ArrayRef,
@@ -520,7 +546,7 @@ impl LiquidArray {
     /// Filter the Liquid array and return an Arrow array. A selection of
     /// another length than the array is an error.
     pub fn filter(&self, selection: &BooleanBuffer) -> Result<ArrayRef, ArrowError> {
-        self.export(self.filtered_vortex(selection)?)
+        self.export(self.filtered_vortex(selection, true)?)
     }
 
     /// Evaluate a predicate on selected rows. A selection of another length
@@ -530,7 +556,15 @@ impl LiquidArray {
         predicate: &LiquidExpr,
         filter: &BooleanBuffer,
     ) -> Result<BooleanArray, ArrowError> {
-        let filtered = self.filtered_vortex(filter)?;
+        // A comparison reads the entry's own values: FSST answers `=` and
+        // `<>` by compressing the literal and a comparison with `''` from
+        // its lengths, and a dictionary compares each distinct value once,
+        // so none decodes a string. ClickBench's `URL <> ''` decoded every
+        // distinct URL for its mask, as much again as the projection that
+        // follows it (Q27, Q28). Any other predicate reads the values
+        // decoded, once per read as an export does.
+        let decode = !Self::compares(predicate);
+        let filtered = self.filtered_vortex(filter, decode)?;
         if let Some(value) = predicate
             .physical_expr()
             .downcast_ref::<Literal>()
@@ -556,7 +590,8 @@ impl LiquidArray {
         }
         match self.try_eval_vortex_predicate(&filtered, predicate) {
             Some(result) => Ok(result),
-            None => eval_predicate_on_array(self.export(filtered)?, predicate),
+            None if decode => eval_predicate_on_array(self.export(filtered)?, predicate),
+            None => eval_predicate_on_array(self.filter(filter)?, predicate),
         }
     }
 }
@@ -896,7 +931,9 @@ mod tests {
     fn assert_predicate_matches(name: &str, array: &ArrayRef, expr: &LiquidExpr) {
         let selection = BooleanBuffer::new_set(array.len());
         let vortex = LiquidArray::from_arrow_array(array).unwrap();
-        let filtered = vortex.filtered_vortex(&selection).unwrap();
+        let filtered = vortex
+            .filtered_vortex(&selection, !LiquidArray::compares(expr))
+            .unwrap();
         if vortex.try_eval_vortex_predicate(&filtered, expr).is_none() {
             eprintln!("Vortex predicate fell back to Arrow: {name}");
         }
@@ -1440,6 +1477,35 @@ mod tests {
             ),
             comparison_expr(
                 DataFusionOperator::NotEq,
+                ScalarValue::Utf8View(Some(String::new())),
+                array.data_type(),
+            ),
+            comparison_expr(
+                DataFusionOperator::Eq,
+                ScalarValue::Utf8View(Some(String::new())),
+                array.data_type(),
+            ),
+            comparison_expr(
+                DataFusionOperator::Eq,
+                ScalarValue::Utf8View(Some(
+                    "https://www.example.com/catalogue/item/8?ref=google&page=1".into(),
+                )),
+                array.data_type(),
+            ),
+            comparison_expr(
+                DataFusionOperator::NotEq,
+                ScalarValue::Utf8View(Some(
+                    "https://www.example.com/catalogue/item/8?ref=google&page=1".into(),
+                )),
+                array.data_type(),
+            ),
+            comparison_expr(
+                DataFusionOperator::Lt,
+                ScalarValue::Utf8View(Some("https://www.example.com/catalogue/item/5".into())),
+                array.data_type(),
+            ),
+            comparison_expr(
+                DataFusionOperator::GtEq,
                 ScalarValue::Utf8View(Some(String::new())),
                 array.data_type(),
             ),
