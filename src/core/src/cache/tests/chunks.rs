@@ -384,3 +384,84 @@ async fn a_batch_tagged_another_form_than_its_record_is_refused() {
     assert_eq!(cache.stats().runtime.disk_read_failures, 1);
     assert!(!cache.contains(&entry(1, 0), 0));
 }
+
+/// Chunk 1 spilled whole, and memory holding chunks 3, 4 and 5 of one batch
+/// each: 3 passed by the hand since its fill and cold, 4 read since, 5 just
+/// filled.
+async fn spilled_beside_three() -> Arc<LiquidCache> {
+    let cache = cache(1 << 30, None).await;
+    insert_chunk(&cache, 1).await;
+    for chunk in [2, 3, 4] {
+        cache
+            .insert(entry(chunk, 0), 0, array(chunk as i64))
+            .await
+            .unwrap();
+    }
+    // Room for chunk 5 passes 2, 3 and 4 once and takes 2.
+    cache.insert(entry(5, 0), 0, array(5)).await.unwrap();
+    assert_eq!(tiers(&cache, 1), vec![Some(true); BATCHES]);
+    assert!(cache.get(&entry(4, 0), 0).read().await.is_some());
+    for chunk in [3, 4, 5] {
+        assert!(!cache.is_on_disk(&entry(chunk, 0), 0));
+    }
+    cache
+}
+
+#[tokio::test]
+async fn a_chunk_read_twice_from_disk_is_offered_for_promotion() {
+    let cache = spilled_beside_three().await;
+    let promotions = Arc::clone(cache.promotions());
+
+    let _ = cache.read_chunk(&entry(1, 0), 0).await;
+    assert_eq!(promotions.pending(), 0);
+    let _ = cache.read_chunk(&entry(1, 2), 0).await;
+    let _ = cache.read_chunk(&entry(1, 1), 0).await;
+    // Offered once, under an entry of the read that found it again.
+    assert_eq!(promotions.pending(), 1);
+    let promotion = promotions.next().await;
+    assert_eq!(cache.chunk_of(&promotion.entry), entry(1, 0));
+    assert_eq!(promotions.pending(), 1);
+    drop(promotion);
+    assert_eq!(promotions.pending(), 0);
+    // Nothing moved.
+    assert_eq!(tiers(&cache, 1), vec![Some(true); BATCHES]);
+}
+
+#[tokio::test]
+async fn a_promotion_takes_only_cold_chunks_and_moves_its_chunk_whole() {
+    let cache = spilled_beside_three().await;
+    let all = usize::MAX;
+
+    // Room for three batches: only chunk 3 is cold, so the promotion takes
+    // it and stops, leaving chunk 1 on disk whole and 4 and 5, read or
+    // filed since the hand last passed them, in memory.
+    assert_eq!(cache.promote_cold(entry(1, 0), 0, all).await, 0);
+    assert_eq!(tiers(&cache, 1), vec![Some(true); BATCHES]);
+    assert!(cache.is_on_disk(&entry(3, 0), 0));
+    for chunk in [4, 5] {
+        assert!(cache.contains(&entry(chunk, 0), 0) && !cache.is_on_disk(&entry(chunk, 0), 0));
+    }
+    assert_eq!(cache.counters().chunks_promoted, 0);
+
+    // That turn passed 4 and 5; nothing read them since, so the next
+    // promotion takes them and brings chunk 1 back whole.
+    let installed = cache.promote_cold(entry(1, 1), 0, all).await;
+    assert_eq!(installed, BATCHES * batch_bytes());
+    assert_eq!(tiers(&cache, 1), vec![Some(false); BATCHES]);
+    assert_eq!(cache.counters().chunks_promoted, 1);
+    for batch in 0..BATCHES {
+        let read = cache.get(&entry(1, batch), 0).read().await.unwrap();
+        assert_eq!(read.as_ref(), array_of(10 + batch).as_ref());
+    }
+}
+
+#[tokio::test]
+async fn a_promotion_past_its_allowance_moves_nothing() {
+    let cache = spilled_beside_three().await;
+    let short = BATCHES * batch_bytes() - 1;
+    assert_eq!(cache.promote_cold(entry(1, 0), 0, short).await, 0);
+    assert_eq!(tiers(&cache, 1), vec![Some(true); BATCHES]);
+    for chunk in [3, 4, 5] {
+        assert!(!cache.is_on_disk(&entry(chunk, 0), 0));
+    }
+}

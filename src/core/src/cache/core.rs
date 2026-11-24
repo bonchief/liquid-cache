@@ -12,7 +12,8 @@ use super::{
     disk::{DiskError, DiskStore, ObjectKey, StoredBatch},
     io_context::EntryMetadata,
     observer::{CacheTracer, InternalEvent, Observer},
-    policies::{CachePolicy, HydrationPolicy, HydrationRequest, MaterializedEntry},
+    policies::{CachePolicy, HydrationPolicy, HydrationRequest, MaterializedEntry, Turn},
+    promotions::Promotions,
     utils::CacheConfig,
 };
 use crate::cache::policies::{EvictionOutcome, EvictionPolicy};
@@ -76,6 +77,9 @@ pub struct LiquidCache {
     /// [`Self::chunk_of`]).
     chunk_mask: usize,
     events: TierEvents,
+    /// Chunks read from disk again since they were filed there, offered for
+    /// [`Self::promote_cold`].
+    promotions: Arc<Promotions>,
     /// The bounds on transcoding inserted byte arrays to Liquid in the
     /// background, once turned on ([`Self::transcode_text_in_background`]).
     background_text: std::sync::OnceLock<Transcodes>,
@@ -424,6 +428,15 @@ pub(super) fn same_memory_entry(slot: &CacheEntry, observed: &CacheEntry) -> boo
 /// The slot an install may replace, when it was made from what the key held
 /// ([`LiquidCache::try_insert_over`]).
 type Over<'a> = Option<&'a (dyn Fn(&Slot) -> bool + Send + Sync)>;
+
+/// Where an insert that lacks room may take it from.
+enum Room<'a> {
+    /// Any victim the policy offers, and the disk when none is left.
+    Any,
+    /// Only chunks cold when the hand reaches them, within one turn of it
+    /// ([`CachePolicy::find_cold_memory_victim`]); refused when none is.
+    Cold(&'a mut Turn),
+}
 
 /// Whether `slot` still holds, for `identity`, the memory entry `observed`.
 fn holds_memory(slot: &Slot, identity: u64, observed: &CacheEntry) -> bool {
@@ -913,8 +926,24 @@ impl LiquidCache {
         &self,
         entry_id: EntryID,
         identity: u64,
+        batch_to_cache: CacheEntry,
+        over: Over<'_>,
+    ) -> Result<(), CacheFull> {
+        self.insert_making(entry_id, identity, batch_to_cache, over, Room::Any)
+            .await
+    }
+
+    /// [`Self::insert_over`], making room as `room` allows: with
+    /// [`Room::Cold`], only from chunks cold when the hand reaches them,
+    /// within one turn of it, and with no room so made the insert is
+    /// refused, never written to disk in its place.
+    async fn insert_making(
+        &self,
+        entry_id: EntryID,
+        identity: u64,
         mut batch_to_cache: CacheEntry,
         over: Over<'_>,
+        mut room: Room<'_>,
     ) -> Result<(), CacheFull> {
         // A write of this entry to disk, made below, for the next install.
         let mut write = None;
@@ -953,8 +982,19 @@ impl LiquidCache {
                     .index
                     .get(&entry_id)
                     .map_or(0, |slot| slot.entry.memory_usage_bytes());
-                self.find_memory_victims_for(new_memory_size.saturating_sub(replaced))
+                let lacking = new_memory_size.saturating_sub(replaced);
+                match &mut room {
+                    Room::Any => self.find_memory_victims_for(lacking, |cnt| {
+                        self.cache_policy.find_memory_victim(cnt)
+                    }),
+                    Room::Cold(turn) => self.find_memory_victims_for(lacking, |cnt| {
+                        self.cache_policy.find_cold_memory_victim(cnt, turn)
+                    }),
+                }
             };
+            if victims.is_empty() && matches!(room, Room::Cold(_)) {
+                return Err(CacheFull);
+            }
             if victims.is_empty() {
                 // no advice, because the cache is already empty
                 // this can happen if the entry to be inserted is too large, in that case,
@@ -992,7 +1032,11 @@ impl LiquidCache {
     /// budget lacks. A victim that transcodes in memory frees less than it
     /// holds, so the insert can come back for more; taking a fixed batch
     /// instead would evict several entries to make room for one.
-    fn find_memory_victims_for(&self, bytes: usize) -> Vec<EntryID> {
+    fn find_memory_victims_for(
+        &self,
+        bytes: usize,
+        mut offer: impl FnMut(usize) -> Vec<EntryID>,
+    ) -> Vec<EntryID> {
         let free = self
             .config
             .max_memory_bytes()
@@ -1003,7 +1047,7 @@ impl LiquidCache {
             let mut offered_new = false;
             // A policy may hand out more than asked; every victim it hands
             // out is off its queues, so all of them are kept.
-            for victim in self.cache_policy.find_memory_victim(1) {
+            for victim in offer(1) {
                 if victims.contains(&victim) {
                     continue;
                 }
@@ -1064,6 +1108,7 @@ impl LiquidCache {
             evict_victims_concurrently,
             chunk_mask,
             events: TierEvents::default(),
+            promotions: Arc::default(),
             background_text: std::sync::OnceLock::new(),
             reads: ReadBudget::new(ReadBudget::DEFAULT_MAX),
         }
@@ -2128,8 +2173,15 @@ impl LiquidCache {
         if Self::charged_bytes(&slot.entry).is_none() {
             return ChunkRead::default();
         }
-        self.cache_policy
-            .notify_access(entry_id, CachedBatchType::from(&slot.entry));
+        // A chunk read from disk again since it was filed there is offered
+        // for promotion; the read itself moves nothing.
+        if self
+            .cache_policy
+            .notify_disk_hit(entry_id, CachedBatchType::from(&slot.entry))
+        {
+            self.promotions
+                .offer(self.chunk_of(entry_id), *entry_id, identity);
+        }
         let Some((object, charge)) = self.read_object(entry_id, identity).await else {
             return ChunkRead::default();
         };
@@ -2204,6 +2256,91 @@ impl LiquidCache {
             promoted += installed;
         }
         promoted
+    }
+
+    /// Chunks read from disk again since they were filed there, for an
+    /// owner to take and pass to [`Self::promote_cold`] off the reads'
+    /// path.
+    pub fn promotions(&self) -> &Arc<Promotions> {
+        &self.promotions
+    }
+
+    /// Read the chunk of `entry_id`, held on disk for `identity`, back into
+    /// memory, in one object read, if what it decodes to is at most
+    /// `allowance` bytes: the memory bytes installed, 0 when it was
+    /// refused.
+    ///
+    /// **A promotion takes memory only from chunks cold when the hand
+    /// reaches them** ([`CachePolicy::find_cold_memory_victim`]): over the
+    /// whole chunk the hand turns each memory queue at most once and never
+    /// takes a chunk read since it last passed it. Room for the whole chunk
+    /// is made before any batch goes in; when the turn finds too little,
+    /// the chunk stays on disk whole, and the cold chunks it did take have
+    /// left memory as any victim leaves it. Each batch goes in only over the
+    /// disk record it was read from, so one removed or replaced meanwhile
+    /// stays so.
+    pub async fn promote_cold(&self, entry_id: EntryID, identity: u64, allowance: usize) -> usize {
+        if !self.is_on_disk(&entry_id, identity) {
+            return 0;
+        }
+        let Some((object, _charge)) = self.read_object(&entry_id, identity).await else {
+            return 0;
+        };
+        let mut decoded = Vec::new();
+        for (entry, form, bytes) in object.batches() {
+            if !self.is_on_disk(&entry, identity) {
+                continue;
+            }
+            match Self::decode_form(form, Bytes::copy_from_slice(&bytes)) {
+                Ok(batch) => decoded.push((entry, batch)),
+                Err(error) => {
+                    self.observer.on_disk_read_failure(&error);
+                    self.drop_unreadable(entry, identity).await;
+                }
+            }
+        }
+        drop(object);
+        let size: usize = decoded
+            .iter()
+            .map(|(_, batch)| batch.memory_usage_bytes())
+            .sum();
+        if decoded.is_empty() || size > allowance || size > self.config.max_memory_bytes() {
+            return 0;
+        }
+        // Room for the whole chunk first, so it moves whole or not at all.
+        let mut turn = Turn::default();
+        loop {
+            let free = self
+                .config
+                .max_memory_bytes()
+                .saturating_sub(self.budget.memory_usage_bytes());
+            if free >= size {
+                break;
+            }
+            let victims = self.find_memory_victims_for(size, |cnt| {
+                self.cache_policy.find_cold_memory_victim(cnt, &mut turn)
+            });
+            if victims.is_empty() {
+                return 0;
+            }
+            self.evict_victims(victims).await;
+        }
+        let mut installed = 0;
+        for (entry, batch) in decoded {
+            let held = batch.memory_usage_bytes();
+            let over = |slot: &Slot| holds_disk(slot, identity);
+            if self
+                .insert_making(entry, identity, batch, Some(&over), Room::Cold(&mut turn))
+                .await
+                .is_ok()
+            {
+                installed += held;
+            }
+        }
+        if installed > 0 {
+            TierEvents::add(&self.events.promoted, 1);
+        }
+        installed
     }
 
     /// `array` in the form the cache keeps a fresh batch in: Liquid when it

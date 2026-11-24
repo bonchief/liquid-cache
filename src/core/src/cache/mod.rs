@@ -11,6 +11,7 @@ mod io_context;
 pub(crate) mod liquid_expr;
 mod observer;
 pub mod policies;
+mod promotions;
 mod reads;
 mod utils;
 
@@ -28,8 +29,9 @@ pub use observer::Observer;
 pub use observer::{CacheStats, RuntimeStats, RuntimeStatsSnapshot};
 pub use policies::{
     AlwaysHydrate, CachePolicy, ChunkCounts, Evict, EvictionPolicy, HydrationPolicy,
-    HydrationRequest, LiquidPolicy, MaterializedEntry, NoHydration, TranscodeEvict,
+    HydrationRequest, LiquidPolicy, MaterializedEntry, NoHydration, TranscodeEvict, Turn,
 };
+pub use promotions::{Promotion, Promotions};
 pub use reads::{ReadBudget, ReadCharge};
 pub use utils::EntryID;
 

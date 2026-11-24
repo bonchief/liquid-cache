@@ -18,10 +18,26 @@ pub struct ChunkCounts {
     pub disk: usize,
 }
 
+/// What is left of one turn of the memory hand for one promotion's room
+/// ([`CachePolicy::find_cold_memory_victim`]): per memory queue, how many of
+/// its tokens the hand may still pop, set at the promotion's first search.
+#[derive(Debug, Default)]
+pub struct Turn {
+    pub(crate) left: Option<[usize; 2]>,
+}
+
 /// The cache policy that guides the replacement of LiquidCache
 pub trait CachePolicy: std::fmt::Debug + Send + Sync {
     /// Give cnt amount of entries to evict when cache is full.
     fn find_memory_victim(&self, cnt: usize) -> Vec<EntryID>;
+
+    /// Memory entries to make room for a promotion: only chunks cold when
+    /// the hand reaches them, the hand passing each memory chunk at most
+    /// once over all of one promotion's searches (`turn`). Empty once the
+    /// turn is spent, and a policy that cannot tell coldness offers none.
+    fn find_cold_memory_victim(&self, _cnt: usize, _turn: &mut Turn) -> Vec<EntryID> {
+        vec![]
+    }
 
     /// Give cnt amount of disk entries to remove when disk is full.
     fn find_disk_victim(&self, _cnt: usize) -> Vec<EntryID> {
@@ -39,6 +55,15 @@ pub trait CachePolicy: std::fmt::Debug + Send + Sync {
 
     /// Notify the cache policy that an entry was accessed.
     fn notify_access(&self, _entry_id: &EntryID, _batch_type: CachedBatchType) {}
+
+    /// Notify the cache policy that an entry was served from disk, and
+    /// return whether its chunk's disk record had been hit already since it
+    /// was filed or the disk hand last passed it: a repeat hit, which the
+    /// cache offers for promotion.
+    fn notify_disk_hit(&self, entry_id: &EntryID, batch_type: CachedBatchType) -> bool {
+        self.notify_access(entry_id, batch_type);
+        false
+    }
 
     /// Notify the cache policy that an entry was removed.
     ///

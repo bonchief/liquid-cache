@@ -38,8 +38,8 @@ impl QueueKind {
 }
 
 /// Where a batch is held. A chunk has one record per tier, so a batch read
-/// from disk and promoted arrives in memory cold: a disk hit never marks the
-/// memory record.
+/// from disk and promoted arrives in a fresh memory record, filed as a fill
+/// is: a disk hit marks only the disk record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Tier {
     Memory,
@@ -252,12 +252,15 @@ impl ChunkClock {
         self.remove_from(chunk, Tier::Disk, entry);
     }
 
-    fn access(&mut self, entry: &EntryID, kind: CachedBatchType) {
+    /// Set the reference bit of `entry`'s chunk in the tier `kind` names,
+    /// and return whether it was set already.
+    fn access(&mut self, entry: &EntryID, kind: CachedBatchType) -> bool {
         let key = (self.chunk_of(entry), Tier::of(kind));
-        if let Some(record) = self.records.get_mut(&key)
-            && record.batches.iter().any(|(id, _)| id == entry)
-        {
-            record.referenced = true;
+        match self.records.get_mut(&key) {
+            Some(record) if record.batches.iter().any(|(id, _)| id == entry) => {
+                std::mem::replace(&mut record.referenced, true)
+            }
+            _ => false,
         }
     }
 
@@ -288,37 +291,78 @@ impl ChunkClock {
         let mut visited = 0;
         for _round in 0..2 {
             for &queue in queues {
-                let turn = self.queues[queue.index()].len();
-                for _ in 0..turn {
-                    if victims.len() >= want {
-                        return (victims, visited);
-                    }
-                    let Some((chunk, stamp)) = self.queues[queue.index()].pop_front() else {
-                        break;
-                    };
-                    visited += 1;
-                    let key = (chunk, queue.tier());
-                    let fresh = self.stamp();
-                    let Some(record) = self.records.get_mut(&key) else {
-                        continue;
-                    };
-                    if record.stamp != stamp || record.queue != queue {
-                        continue;
-                    }
-                    if record.referenced {
-                        record.referenced = false;
-                        record.stamp = fresh;
-                        self.queues[queue.index()].push_back((chunk, fresh));
-                        continue;
-                    }
-                    if let Some(record) = self.records.remove(&key) {
-                        self.counts[queue.index()] = self.counts[queue.index()].saturating_sub(1);
-                        victims.extend(record.batches.into_iter().map(|(id, _)| id));
-                    }
+                let tokens = self.queues[queue.index()].len();
+                visited += self.turn(queue, tokens, want, &mut victims);
+                if victims.len() >= want {
+                    return (victims, visited);
                 }
             }
         }
         (victims, visited)
+    }
+
+    /// Memory chunks for a promotion's room, until they hold at least
+    /// `want` batches: only chunks cold when the hand reaches them, each
+    /// memory queue turned at most once around over every search one
+    /// promotion makes (`turn`, set at its first). A referenced chunk the
+    /// hand passes has its bit cleared, as any search clears it, so a
+    /// promotion moves the hand on too; but it is not taken in the same
+    /// turn. **A promotion never evicts a chunk read since the hand last
+    /// passed it**, and never revisits one it passed.
+    fn cold(&mut self, want: usize, turn: &mut super::Turn) -> Vec<EntryID> {
+        let mut left = match turn.left {
+            Some(left) => left,
+            None => QueueKind::MEMORY.map(|queue| self.queues[queue.index()].len()),
+        };
+        let mut victims = Vec::new();
+        for (index, queue) in QueueKind::MEMORY.into_iter().enumerate() {
+            if victims.len() >= want {
+                break;
+            }
+            let tokens = left[index].min(self.queues[queue.index()].len());
+            left[index] -= self.turn(queue, tokens, want, &mut victims);
+        }
+        turn.left = Some(left);
+        victims
+    }
+
+    /// Turn `queue` by at most `tokens` tokens, until `victims` holds `want`
+    /// batches: a referenced chunk at the hand is passed over, its bit
+    /// cleared and its token moved to the back; an unreferenced one is
+    /// taken. Returns how many tokens it popped.
+    fn turn(
+        &mut self,
+        queue: QueueKind,
+        tokens: usize,
+        want: usize,
+        victims: &mut Vec<EntryID>,
+    ) -> usize {
+        let mut popped = 0;
+        while popped < tokens && victims.len() < want {
+            let Some((chunk, stamp)) = self.queues[queue.index()].pop_front() else {
+                break;
+            };
+            popped += 1;
+            let key = (chunk, queue.tier());
+            let fresh = self.stamp();
+            let Some(record) = self.records.get_mut(&key) else {
+                continue;
+            };
+            if record.stamp != stamp || record.queue != queue {
+                continue;
+            }
+            if record.referenced {
+                record.referenced = false;
+                record.stamp = fresh;
+                self.queues[queue.index()].push_back((chunk, fresh));
+                continue;
+            }
+            if let Some(record) = self.records.remove(&key) {
+                self.counts[queue.index()] = self.counts[queue.index()].saturating_sub(1);
+                victims.extend(record.batches.into_iter().map(|(id, _)| id));
+            }
+        }
+        popped
     }
 
     fn counts(&self) -> ChunkCounts {
@@ -399,6 +443,17 @@ impl CachePolicy for LiquidPolicy {
 
     fn notify_access(&self, entry_id: &EntryID, batch_type: CachedBatchType) {
         self.state().access(entry_id, batch_type);
+    }
+
+    fn notify_disk_hit(&self, entry_id: &EntryID, batch_type: CachedBatchType) -> bool {
+        self.state().access(entry_id, batch_type)
+    }
+
+    fn find_cold_memory_victim(&self, cnt: usize, turn: &mut super::Turn) -> Vec<EntryID> {
+        if cnt == 0 {
+            return vec![];
+        }
+        self.state().cold(cnt, turn)
     }
 
     fn notify_remove(&self, entry_id: &EntryID) {
@@ -642,6 +697,103 @@ mod tests {
             visited <= 2 * tokens,
             "visited {visited} of {tokens} tokens"
         );
+    }
+
+    #[test]
+    fn test_a_repeat_disk_hit_is_reported_once_filed() {
+        let policy = LiquidPolicy::new();
+        let spilled = entry(1);
+        policy.notify_insert(&spilled, CachedBatchType::DiskArrow);
+
+        assert!(!policy.notify_disk_hit(&spilled, CachedBatchType::DiskArrow));
+        assert!(policy.notify_disk_hit(&spilled, CachedBatchType::DiskArrow));
+        // Filed on disk again, it starts over.
+        policy.notify_insert(&spilled, CachedBatchType::MemoryArrow);
+        policy.notify_insert(&spilled, CachedBatchType::DiskArrow);
+        assert!(!policy.notify_disk_hit(&spilled, CachedBatchType::DiskArrow));
+    }
+
+    #[test]
+    fn test_a_cold_search_takes_only_cold_chunks_within_one_turn() {
+        let policy = LiquidPolicy::new();
+        let liquid = entry(1);
+        let arrow = entry(2);
+        policy.notify_insert(&liquid, CachedBatchType::MemoryLiquid);
+        policy.notify_insert(&arrow, CachedBatchType::MemoryArrow);
+
+        // Both filed referenced: one turn passes both, clearing them, and
+        // takes neither; the spent turn offers nothing more.
+        let mut turn = super::super::Turn::default();
+        assert!(policy.find_cold_memory_victim(1, &mut turn).is_empty());
+        assert!(policy.find_cold_memory_victim(1, &mut turn).is_empty());
+
+        // A new turn finds both cold, Arrow first; one read since is passed.
+        policy.notify_access(&arrow, CachedBatchType::MemoryArrow);
+        let mut turn = super::super::Turn::default();
+        assert_eq!(policy.find_cold_memory_victim(1, &mut turn), vec![liquid]);
+        assert!(policy.find_cold_memory_victim(1, &mut turn).is_empty());
+        assert_eq!(policy.chunk_counts().memory_arrow, 1);
+    }
+
+    #[test]
+    fn test_a_cold_search_never_takes_a_chunk_referenced_when_reached() {
+        let policy = LiquidPolicy::new();
+        let mut held: Vec<(EntryID, CachedBatchType)> = Vec::new();
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let mut id = 0;
+        for _ in 0..2_000 {
+            match next(4) {
+                0 | 1 => {
+                    id += 1;
+                    let kind = if next(2) == 0 {
+                        CachedBatchType::MemoryArrow
+                    } else {
+                        CachedBatchType::MemoryLiquid
+                    };
+                    policy.notify_insert(&entry(id), kind);
+                    held.push((entry(id), kind));
+                }
+                2 if !held.is_empty() => {
+                    let (chunk, kind) = held[next(held.len() as u64) as usize];
+                    policy.notify_access(&chunk, kind);
+                }
+                _ => {
+                    let referenced: Vec<EntryID> = {
+                        let state = policy.state();
+                        state
+                            .records
+                            .iter()
+                            .filter(|((_, tier), record)| {
+                                *tier == Tier::Memory && record.referenced
+                            })
+                            .map(|((chunk, _), _)| *chunk)
+                            .collect()
+                    };
+                    let mut turn = super::super::Turn::default();
+                    let mut taken = Vec::new();
+                    loop {
+                        let victims = policy.find_cold_memory_victim(1, &mut turn);
+                        if victims.is_empty() {
+                            break;
+                        }
+                        taken.extend(victims);
+                    }
+                    for victim in &taken {
+                        assert!(
+                            !referenced.contains(victim),
+                            "a promotion's turn took {victim:?}, referenced when it began"
+                        );
+                    }
+                    held.retain(|(chunk, _)| !taken.contains(chunk));
+                }
+            }
+        }
     }
 
     #[test]
